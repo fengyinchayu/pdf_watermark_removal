@@ -2,7 +2,6 @@ import streamlit as st
 import pdfplumber
 from docx import Document
 import os
-import zipfile
 from datetime import datetime
 import re
 
@@ -139,24 +138,45 @@ def normalise(text):
 
 
 def extract_header_info(pdf_file):
+    """
+    Scan every table in the PDF looking for label->value pairs.
+    Handles both:
+      2-column tables  (label | value)
+      4-column tables  (label | value | label | value)
+
+    Extra rule: if a cell value contains a weight pattern like
+    25kg / 1000 kg / 500g and quantity has not been found yet,
+    capture it regardless of the label text.
+
+    Returns a dict keyed by our internal field names.
+    """
     found = {}
-    weight_re = re.compile(r"^\d[\d,. ]*\s*(kg|g|lbs?|lb)", re.IGNORECASE)
+    # Matches: 25kg / 25 kg / 1,000 kg / 2.5KG / 500g / 500 G
+    weight_re = re.compile(r"^\d[\d,. ]*\s*(kg|g|lbs?|lb)", re.IGNORECASE)
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
                 for row in table:
+                    # Clean cells
                     cells = [c.strip() if c else "" for c in row]
+
+                    # Walk cells in label/value pairs: (0,1), (2,3), (4,5) ...
                     for i in range(0, len(cells) - 1, 2):
                         label = normalise(cells[i])
                         value = cells[i + 1].strip()
+
                         if not value:
                             continue
+
+                        # Standard label-map lookup
                         if label in HEADER_LABEL_MAP:
                             key = HEADER_LABEL_MAP[label]
-                            if key not in found:
+                            if key not in found:   # first occurrence wins
                                 found[key] = value
+
+                        # Fallback: value looks like a weight -> quantity
                         elif "quantity" not in found and weight_re.match(value):
                             found["quantity"] = value
 
@@ -215,6 +235,8 @@ def extract_coa_tables(pdf_file):
 
 
 def replace_placeholders_in_doc(doc, header_data):
+    """Replace {{key}} placeholders in all paragraphs and table cells."""
+
     def replace_in_paragraph(paragraph, data):
         full_text = "".join(run.text for run in paragraph.runs)
         replaced = False
@@ -348,6 +370,7 @@ HEADER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SN
 
 
 def _extract_image_thumbnail(xobj):
+    """Try to render an image XObject as a small PNG. Returns bytes or None."""
     try:
         width  = int(xobj.get("/Width",  0))
         height = int(xobj.get("/Height", 0))
@@ -359,6 +382,7 @@ def _extract_image_thumbnail(xobj):
         filter_val = xobj.get("/Filter", "")
         filters = [str(f) for f in filter_val] if hasattr(filter_val, "__iter__") and not isinstance(filter_val, str) else [str(filter_val)]
 
+        # JPEG-compressed
         if "/DCTDecode" in filters:
             img = PILImage.open(io.BytesIO(data))
         else:
@@ -381,8 +405,19 @@ def _extract_image_thumbnail(xobj):
 
 
 def scan_xobjects(pdf_bytes):
+    """
+    Scan all pages of a PDF for XObjects referenced by Do operators.
+    Returns a list of dicts:
+      {
+        "name":      "/Im0",          # XObject name in content stream
+        "subtype":   "Image"|"Form",  # /Subtype from XObject dict
+        "pages":     [1, 2, ...],     # 1-based page numbers where it appears
+        "thumbnail": <bytes>|None,    # PNG thumbnail bytes for Image type
+      }
+    Deduplicates by name; first-seen page wins for the thumbnail.
+    """
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    seen   = {}
+    seen   = {}   # name (str) -> dict
 
     for page_num, page in enumerate(reader.pages):
         content = page.get_contents()
@@ -394,6 +429,7 @@ def scan_xobjects(pdf_bytes):
         except Exception:
             continue
 
+        # Collect XObject names actually invoked with Do on this page
         do_names = set()
         for operands, operator in content_obj.operations:
             if operator == b"Do" and operands:
@@ -434,6 +470,11 @@ def scan_xobjects(pdf_bytes):
 
 
 def remove_selected(input_pdf_bytes, output_path, names_to_remove, remove_gs=False):
+    """
+    Remove only the XObjects whose names are in names_to_remove.
+    names_to_remove : set of strings e.g. {"/Im0", "/Wm1"}
+    remove_gs       : also strip gs (graphic state) operators if True
+    """
     reader = PdfReader(io.BytesIO(input_pdf_bytes))
     writer = PdfWriter()
 
@@ -471,6 +512,7 @@ def remove_selected(input_pdf_bytes, output_path, names_to_remove, remove_gs=Fal
 
 def make_header_overlay(page_width, page_height, header_img_path,
                         img_width_pt, top_margin_pt):
+    """Build a single-page PDF in memory with only the header image at the top."""
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
 
@@ -488,6 +530,7 @@ def make_header_overlay(page_width, page_height, header_img_path,
 
 
 def add_header_to_pdf(input_path, output_path, img_width_frac=0.98, top_margin_pt=10):
+    """Stamp the SN header image onto every page of the PDF."""
     reader = PdfReader(input_path)
     writer = PdfWriter()
 
@@ -503,68 +546,6 @@ def add_header_to_pdf(input_path, output_path, img_width_frac=0.98, top_margin_p
     with open(output_path, "wb") as f:
         writer.write(f)
     return output_path
-
-
-# ==============================
-# PDF Unlock Functions
-# ==============================
-
-def _try_unlock_reader(pdf_bytes: bytes, password: str) -> tuple[PdfReader | None, str]:
-    """
-    Attempt to open a PDF and decrypt it.
-    Returns (reader, status_string).
-    status: "not_encrypted" | "unlocked" | "wrong_password" | "error"
-    """
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-    except Exception as e:
-        return None, f"error:{e}"
-
-    if not reader.is_encrypted:
-        return reader, "not_encrypted"
-
-    # Try supplied password first, then empty string (owner lock / no user pw)
-    passwords_to_try = [password] if password else []
-    passwords_to_try.append("")  # always try blank as fallback
-
-    for pw in passwords_to_try:
-        try:
-            result = reader.decrypt(pw)
-            if result.value > 0:          # 1 = user pw, 2 = owner pw
-                return reader, "unlocked"
-        except Exception:
-            pass
-
-    return None, "wrong_password"
-
-
-def unlock_pdf(pdf_bytes: bytes, password: str = "") -> tuple[bytes | None, str]:
-    """
-    Decrypt a PDF and return the raw bytes of the unlocked file.
-    Returns (unlocked_bytes, status).
-    status: "not_encrypted" | "unlocked" | "wrong_password" | "error:..."
-    """
-    reader, status = _try_unlock_reader(pdf_bytes, password)
-
-    if status == "not_encrypted":
-        # File is not encrypted — clone it as-is so the user still gets a clean copy
-        writer = PdfWriter()
-        for page in reader.pages:
-            writer.add_page(page)
-        buf = io.BytesIO()
-        writer.write(buf)
-        return buf.getvalue(), "not_encrypted"
-
-    if status == "unlocked":
-        writer = PdfWriter()
-        writer.append_pages_from_reader(reader)
-        # Explicitly clear encryption metadata
-        writer._encrypt = None
-        buf = io.BytesIO()
-        writer.write(buf)
-        return buf.getvalue(), "unlocked"
-
-    return None, status
 
 
 # ==============================
@@ -587,7 +568,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigate to",
-        options=["📄 SPEC & COA Generator", "🚿 Watermark Remover", "🔓 PDF Unlocker"],
+        options=["📄 SPEC & COA Generator", "🚿 Watermark Remover"],
         label_visibility="collapsed"
     )
     st.markdown("---")
@@ -602,6 +583,7 @@ if page == "📄 SPEC & COA Generator":
 
     st.title("📄 SPEC & COA Generator")
 
+    # ── Upload section ────────────────────────────────────────────────────────
     st.subheader("Upload Supplier Documents")
 
     col_up1, col_up2 = st.columns(2)
@@ -636,6 +618,7 @@ if page == "📄 SPEC & COA Generator":
 
     st.divider()
 
+    # ── Editable product / batch fields ──────────────────────────────────────
     st.subheader("Product & Batch Information")
     st.caption("Fields are pre-filled from the PDF after clicking Extract. You can edit any value before generating.")
 
@@ -656,6 +639,7 @@ if page == "📄 SPEC & COA Generator":
         origin       = st.text_input("Country of Origin",  value=st.session_state["origin"],        key="in_origin")
         solvent      = st.text_input("Extraction Solvent", value=st.session_state["solvent"],       key="in_solvent")
 
+    # ── Template placeholder mapping ──────────────────────────────────────────
     header_data = {
         "ProductName": product_name,
         "Brand":       brand,
@@ -673,6 +657,7 @@ if page == "📄 SPEC & COA Generator":
 
     st.divider()
 
+    # ── Generate buttons ──────────────────────────────────────────────────────
     gen_col1, gen_col2 = st.columns(2)
 
     with gen_col1:
@@ -713,11 +698,13 @@ elif page == "🚿 Watermark Remover":
     st.title("🚿 Watermark Remover")
     st.caption("Scan your PDFs to preview every embedded overlay, choose what to remove, then process.")
 
+    # ── Session state defaults for this page ─────────────────────────────────
     if "wm_scan_results" not in st.session_state:
-        st.session_state["wm_scan_results"] = []
+        st.session_state["wm_scan_results"] = []      # list of XObject dicts
     if "wm_remove_set" not in st.session_state:
-        st.session_state["wm_remove_set"] = set()
+        st.session_state["wm_remove_set"] = set()     # names the user wants removed
 
+    # ── STEP 1 — Upload ───────────────────────────────────────────────────────
     st.subheader("① Upload PDF(s)")
 
     uploaded_files = st.file_uploader(
@@ -733,11 +720,12 @@ elif page == "🚿 Watermark Remover":
 
     st.write(f"{len(uploaded_files)} file(s) uploaded.")
 
+    # ── STEP 2 — Scan ─────────────────────────────────────────────────────────
     st.divider()
     st.subheader("② Scan for Overlays & Images")
 
     if st.button("🔍 Scan PDFs for embedded elements"):
-        combined = {}
+        combined = {}   # name -> aggregated dict across all files
 
         with st.spinner("Scanning..."):
             for uploaded in uploaded_files:
@@ -748,9 +736,11 @@ elif page == "🚿 Watermark Remover":
                         if name not in combined:
                             combined[name] = item.copy()
                         else:
+                            # Merge page lists (keep de-duplicated)
                             combined[name]["pages"] = sorted(
                                 set(combined[name]["pages"] + item["pages"])
                             )
+                            # Prefer a thumbnail if we have one
                             if combined[name]["thumbnail"] is None and item["thumbnail"]:
                                 combined[name]["thumbnail"] = item["thumbnail"]
                 except Exception as e:
@@ -758,6 +748,8 @@ elif page == "🚿 Watermark Remover":
 
         st.session_state["wm_scan_results"] = list(combined.values())
 
+        # Auto-select Form XObjects (most common watermark type) and images
+        # whose name hints suggest a watermark
         wm_hints = {"wm", "watermark", "mark", "stamp", "logo", "bg", "background"}
         auto_remove = set()
         for item in st.session_state["wm_scan_results"]:
@@ -774,6 +766,7 @@ elif page == "🚿 Watermark Remover":
         else:
             st.warning("No Do-operator XObjects found in these PDFs.")
 
+    # ── STEP 3 — Review & select ──────────────────────────────────────────────
     scan_results = st.session_state["wm_scan_results"]
 
     if scan_results:
@@ -796,9 +789,11 @@ elif page == "🚿 Watermark Remover":
                     pages    = item["pages"]
                     thumb    = item["thumbnail"]
 
+                    # Thumbnail or placeholder
                     if thumb:
                         st.image(thumb, use_container_width=True)
                     else:
+                        # Placeholder box for Form / unknown types
                         if subtype == "Form":
                             icon, label = "📐", "Vector / Form"
                         else:
@@ -810,6 +805,7 @@ elif page == "🚿 Watermark Remover":
                             unsafe_allow_html=True
                         )
 
+                    # Info + checkbox
                     page_str = (f"p.{pages[0]}" if len(pages) == 1
                                 else f"p.{pages[0]}–{pages[-1]}" if pages == list(range(pages[0], pages[-1]+1))
                                 else f"{len(pages)} pages")
@@ -827,6 +823,7 @@ elif page == "🚿 Watermark Remover":
 
         st.session_state["wm_remove_set"] = remove_set
 
+        # gs operator option
         st.divider()
         remove_gs = st.checkbox(
             "Also strip `gs` (graphic state) operators  ⚠️ may affect some page rendering",
@@ -841,6 +838,7 @@ elif page == "🚿 Watermark Remover":
         else:
             st.warning("Nothing selected — processing will leave PDFs unchanged.")
 
+        # ── STEP 4 — Company header ───────────────────────────────────────────
         st.divider()
         st.subheader("④ Company Header (optional)")
 
@@ -876,6 +874,7 @@ elif page == "🚿 Watermark Remover":
                     key="wm_top_margin"
                 )
 
+        # ── STEP 5 — Process ─────────────────────────────────────────────────
         st.divider()
 
         if st.button("⚙️ Process Files", type="primary"):
@@ -890,6 +889,7 @@ elif page == "🚿 Watermark Remover":
                     output_name = f"SN-{safe_name}"
                     output_path = f"outputs/{output_name}"
 
+                    # Step A — selective removal
                     remove_selected(
                         uploaded.read(),
                         output_path,
@@ -897,6 +897,7 @@ elif page == "🚿 Watermark Remover":
                         remove_gs=remove_gs
                     )
 
+                    # Step B — optional header stamp
                     if add_header and header_exists:
                         headed_path = output_path.replace(".pdf", "_headed.pdf")
                         add_header_to_pdf(output_path, headed_path,
@@ -934,183 +935,3 @@ elif page == "🚿 Watermark Remover":
                             mime="application/pdf",
                             key=f"dl_{output_name}"
                         )
-
-
-# ==============================
-# PAGE 3 — PDF Unlocker
-# ==============================
-
-elif page == "🔓 PDF Unlocker":
-
-    st.title("🔓 PDF Unlocker")
-    st.caption(
-        "Remove encryption and permission restrictions from PDFs. "
-        "Supports owner-locked files (no password needed) and user-password-protected files."
-    )
-
-    # ── STEP 1 — Upload ───────────────────────────────────────────────────────
-    st.subheader("① Upload PDF(s)")
-
-    unlock_files = st.file_uploader(
-        "Upload one or more locked PDF files",
-        type="pdf",
-        accept_multiple_files=True,
-        key="unlock_uploader"
-    )
-
-    if not unlock_files:
-        st.info("Upload one or more PDFs to get started.")
-        st.stop()
-
-    st.write(f"{len(unlock_files)} file(s) uploaded.")
-
-    # ── STEP 2 — Password (optional) ─────────────────────────────────────────
-    st.divider()
-    st.subheader("② Password (optional)")
-    st.caption(
-        "Leave blank if the PDFs are owner-locked only (print/copy restrictions) "
-        "with no user-open password. Enter a password only if the file asks for one to open."
-    )
-
-    unlock_password = st.text_input(
-        "Password",
-        type="password",
-        placeholder="Leave blank if no open password is required",
-        key="unlock_password"
-    )
-
-    same_pw_for_all = True
-    if len(unlock_files) > 1:
-        same_pw_for_all = st.checkbox(
-            "Use the same password for all files",
-            value=True,
-            key="unlock_same_pw"
-        )
-        if not same_pw_for_all:
-            st.info(
-                "Per-file passwords are not supported in batch mode. "
-                "Enter a shared password above, or process files one at a time."
-            )
-
-    # ── STEP 3 — Output naming ────────────────────────────────────────────────
-    st.divider()
-    st.subheader("③ Output Options")
-
-    prefix = st.text_input(
-        "Output filename prefix",
-        value="unlocked-",
-        help="This prefix is prepended to each original filename.",
-        key="unlock_prefix"
-    )
-
-    # ── STEP 4 — Unlock ───────────────────────────────────────────────────────
-    st.divider()
-
-    if st.button("🔓 Unlock PDF(s)", type="primary"):
-
-        results  = []   # list of (output_name, output_path, status)
-        errors   = []   # list of (fname, reason)
-        skipped  = []   # list of (fname, "not_encrypted")
-
-        progress = st.progress(0, text="Unlocking...")
-
-        for i, uploaded in enumerate(unlock_files):
-            fname = uploaded.name
-            try:
-                pdf_bytes = uploaded.read()
-                unlocked_bytes, status = unlock_pdf(pdf_bytes, password=unlock_password)
-
-                safe_name   = fname.replace(" ", "_")
-                output_name = f"{prefix}{safe_name}"
-                output_path = f"outputs/{output_name}"
-
-                if status in ("unlocked", "not_encrypted"):
-                    with open(output_path, "wb") as f:
-                        f.write(unlocked_bytes)
-                    results.append((output_name, output_path, status))
-                    if status == "not_encrypted":
-                        skipped.append(fname)
-
-                elif status == "wrong_password":
-                    errors.append((fname, "Wrong or missing password — could not decrypt."))
-
-                else:
-                    # status starts with "error:"
-                    errors.append((fname, status.replace("error:", "", 1)))
-
-            except Exception as e:
-                errors.append((fname, str(e)))
-
-            progress.progress(
-                (i + 1) / len(unlock_files),
-                text=f"Processing {i + 1}/{len(unlock_files)}…"
-            )
-
-        progress.empty()
-
-        # ── Results summary ────────────────────────────────────────────────
-        unlocked_count  = len([r for r in results if r[2] == "unlocked"])
-        passthru_count  = len([r for r in results if r[2] == "not_encrypted"])
-        error_count     = len(errors)
-
-        if unlocked_count:
-            st.success(f"✅ {unlocked_count} file(s) successfully unlocked.")
-        if passthru_count:
-            st.info(
-                f"ℹ️ {passthru_count} file(s) were not encrypted — "
-                "copied through unchanged: "
-                + ", ".join(f"`{n}`" for n in skipped)
-            )
-        for fname, reason in errors:
-            st.error(f"❌ **{fname}**: {reason}")
-
-        # ── Download buttons ───────────────────────────────────────────────
-        if results:
-            st.divider()
-            st.subheader("⬇️ Download Unlocked Files")
-
-            # Batch ZIP download (shown whenever there are 2+ files)
-            if len(results) > 1:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for output_name, output_path, _ in results:
-                        zf.write(output_path, arcname=output_name)
-                zip_buf.seek(0)
-                st.download_button(
-                    label=f"⬇️ Download All ({len(results)} files) as ZIP",
-                    data=zip_buf,
-                    file_name="unlocked_pdfs.zip",
-                    mime="application/zip",
-                    key="dl_unlock_all_zip",
-                    type="primary",
-                    use_container_width=True,
-                )
-                st.caption("Or download files individually:")
-
-            for output_name, output_path, status in results:
-                label_suffix = " *(was not encrypted)*" if status == "not_encrypted" else ""
-                with open(output_path, "rb") as f:
-                    st.download_button(
-                        label=f"⬇️ {output_name}{label_suffix}",
-                        data=f,
-                        file_name=output_name,
-                        mime="application/pdf",
-                        key=f"dl_unlock_{output_name}"
-                    )
-
-    # ── Helper note ───────────────────────────────────────────────────────────
-    with st.expander("ℹ️ How does this work?"):
-        st.markdown("""
-**Two kinds of PDF locks:**
-
-| Type | What it does | Password needed to unlock? |
-|------|-------------|---------------------------|
-| **User password** (open password) | Prevents opening the file | ✅ Yes — enter it above |
-| **Owner password** (permissions lock) | Restricts printing, copying, editing | ❌ No — unlocked automatically |
-
-**Batch processing:** Upload multiple files at once. All will be processed with the same password (if any).
-
-**Output files** are prefixed with the text you set in ③ and are immediately available for download after processing.
-
-> *This tool uses [pypdf](https://pypdf.readthedocs.io/) for decryption. It cannot brute-force unknown user passwords.*
-        """)
