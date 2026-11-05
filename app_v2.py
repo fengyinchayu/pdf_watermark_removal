@@ -342,9 +342,25 @@ def fill_coa_template(header_data, general_rows, micro_rows):
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream, NameObject, DecodedStreamObject
 import io
+import numpy as np
 from PIL import Image as PILImage
 
+try:
+    import pymupdf as fitz  # PyMuPDF — page rendering for preview + colour removal
+except ImportError:
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
+
+try:  # optional: lets users click on the preview to pick a colour
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except ImportError:
+    streamlit_image_coordinates = None
+
 HEADER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SN_Header.png")
+PREVIEW_DPI = 110
+PICK_WIDTH = 620   # display width (px) of the clickable preview
 
 
 def _extract_image_thumbnail(xobj):
@@ -433,7 +449,13 @@ def scan_xobjects(pdf_bytes):
     return list(seen.values())
 
 
-def remove_selected(input_pdf_bytes, output_path, names_to_remove, remove_gs=False):
+@st.cache_data(show_spinner=False, max_entries=16)
+def remove_selected_bytes(input_pdf_bytes, names_to_remove, remove_gs=False):
+    """Strip the chosen XObjects (and optionally gs operators). bytes -> bytes."""
+    names_to_remove = set(names_to_remove)
+    if not names_to_remove and not remove_gs:
+        return input_pdf_bytes
+
     reader = PdfReader(io.BytesIO(input_pdf_bytes))
     writer = PdfWriter()
 
@@ -464,8 +486,16 @@ def remove_selected(input_pdf_bytes, output_path, names_to_remove, remove_gs=Fal
         page[NameObject("/Contents")] = new_stream
         writer.add_page(page)
 
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def remove_selected(input_pdf_bytes, output_path, names_to_remove, remove_gs=False):
+    """File-writing wrapper kept for backwards compatibility."""
+    data = remove_selected_bytes(input_pdf_bytes, tuple(sorted(names_to_remove)), remove_gs)
     with open(output_path, "wb") as f:
-        writer.write(f)
+        f.write(data)
     return output_path
 
 
@@ -487,22 +517,195 @@ def make_header_overlay(page_width, page_height, header_img_path,
     return buf.read()
 
 
-def add_header_to_pdf(input_path, output_path, img_width_frac=0.98, top_margin_pt=10):
-    reader = PdfReader(input_path)
+def add_header_bytes(pdf_bytes, img_width_frac=0.98, top_margin_pt=10):
+    reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
 
     for page in reader.pages:
         pw = float(page.mediabox.width)
         ph = float(page.mediabox.height)
-        overlay_bytes  = make_header_overlay(pw, ph, HEADER_IMAGE_PATH,
-                                             pw * img_width_frac, top_margin_pt)
-        overlay_page   = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
+        overlay_bytes = make_header_overlay(pw, ph, HEADER_IMAGE_PATH,
+                                            pw * img_width_frac, top_margin_pt)
+        overlay_page  = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
         page.merge_page(overlay_page)
         writer.add_page(page)
 
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def add_header_to_pdf(input_path, output_path, img_width_frac=0.98, top_margin_pt=10):
+    """File-writing wrapper kept for backwards compatibility."""
+    with open(input_path, "rb") as f:
+        data = add_header_bytes(f.read(), img_width_frac, top_margin_pt)
     with open(output_path, "wb") as f:
-        writer.write(f)
+        f.write(data)
     return output_path
+
+
+# ------------------------------------------------------------------
+# Colour (stamp / signature / seal) removal
+# ------------------------------------------------------------------
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_hex(c):
+    return "#%02x%02x%02x" % tuple(int(v) for v in c)
+
+
+def _grow(mask, r):
+    """Expand a boolean mask by r pixels in every direction."""
+    out = mask.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx or dy:
+                out |= np.roll(np.roll(mask, dy, axis=0), dx, axis=1)
+    return out
+
+
+def remove_colors(img, targets, hue_tol=25, sat_min=10, whiten=70):
+    """
+    Remove pixels whose hue is close to any target colour.
+
+    In the channel where an ink is brightest (red for a red seal, blue for a
+    purple one) the ink nearly vanishes while black text underneath still
+    shows, so matched pixels are replaced by that channel as grey. The stamp
+    disappears and overlapping text survives.
+      hue_tol - hue distance (degrees) still counted as the same ink
+      sat_min - minimum colour strength (%) for a pixel to count as ink
+      whiten  - leftover grey lighter than this (%) becomes pure white
+    """
+    rgb = np.array(img.convert("RGB")).astype(np.float32)
+    hsv = np.array(img.convert("HSV")).astype(np.int16)
+    h, s = hsv[..., 0], hsv[..., 1]
+    colored = s >= sat_min * 255 / 100
+    out = rgb.copy()
+    tol = hue_tol * 255 / 360
+
+    for color in targets:
+        th = int(np.array(PILImage.new("RGB", (1, 1), tuple(color)).convert("HSV"))[0, 0, 0])
+        d = np.abs(h - th)
+        d = np.minimum(d, 256 - d)              # hue wraps around (red is at both ends)
+        core = colored & (d <= tol)
+        if not core.any():
+            continue
+        match = _grow(core, 1)                  # catch the soft edges of the ink
+        ch = int(np.argmax(color))              # channel where this ink is brightest
+        ref = max(np.percentile(rgb[..., ch][core], 75), 1)
+        gray = np.clip(rgb[..., ch] * (255.0 / ref), 0, 255)
+        gray[gray >= whiten * 255 / 100] = 255
+        out[match] = gray[match][:, None]
+
+    return PILImage.fromarray(out.astype(np.uint8))
+
+
+def detect_ink_colors(img, max_colors=6, min_share=0.0008):
+    """Find the main coloured inks on a page (ignores black/grey/white)."""
+    hsv = np.array(img.convert("HSV")).reshape(-1, 3).astype(np.int32)
+    rgb = np.array(img.convert("RGB")).reshape(-1, 3)
+    mask = (hsv[:, 1] >= 64) & (hsv[:, 2] >= 60)
+    if not mask.any():
+        return []
+    bins = hsv[mask, 0] * 24 // 256            # 24 hue buckets of 15°
+    cols = rgb[mask]
+    counts = np.bincount(bins, minlength=24)
+    threshold = max(min_share * hsv.shape[0], 25)
+
+    found = []
+    for b in np.argsort(counts)[::-1]:
+        if counts[b] < threshold:
+            break
+        if any(min(abs(int(b) - f), 24 - abs(int(b) - f)) <= 1 for f, _ in found):
+            continue                            # neighbour of an ink we already have
+        found.append((int(b), tuple(int(v) for v in np.median(cols[bins == b], axis=0))))
+        if len(found) >= max_colors:
+            break
+    return [c for _, c in found]
+
+
+def pick_color_at(img, x, y, radius=4):
+    """Most saturated pixel around (x, y), or None if the spot is grey/white/black."""
+    box = img.crop((max(0, x - radius), max(0, y - radius),
+                    min(img.width, x + radius + 1), min(img.height, y + radius + 1)))
+    hsv = np.array(box.convert("HSV")).reshape(-1, 3)
+    rgb = np.array(box.convert("RGB")).reshape(-1, 3)
+    if hsv.size == 0:
+        return None
+    i = int(hsv[:, 1].argmax())
+    if hsv[i, 1] < 40:
+        return None
+    return tuple(int(v) for v in rgb[i])
+
+
+def rasterize_remove_colors(pdf_bytes, targets, params, dpi=300):
+    """Render every page, remove the colours, rebuild a PDF with the same page sizes."""
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = fitz.open()
+    for page in src:
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        img = PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        img = remove_colors(img, targets, *params)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.insert_image(new_page.rect, stream=buf.getvalue())
+    data = out.tobytes(deflate=True, garbage=3)
+    out.close()
+    src.close()
+    return data
+
+
+# ------------------------------------------------------------------
+# Preview helpers
+# ------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def pdf_page_count(pdf_bytes):
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        return doc.page_count
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def render_page(pdf_bytes, page_index, dpi=PREVIEW_DPI):
+    """Return (PIL image, page width pt, page height pt)."""
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        page = doc[page_index]
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        img = PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        return img, page.rect.width, page.rect.height
+
+
+def paste_header(img, page_width_pt, dpi, width_frac, top_margin_pt):
+    """Raster version of the header overlay, used only for the preview."""
+    hdr = PILImage.open(HEADER_IMAGE_PATH).convert("RGBA")
+    scale = dpi / 72
+    w = max(1, int(page_width_pt * width_frac * scale))
+    h = max(1, int(w * hdr.height / hdr.width))
+    hdr = hdr.resize((w, h), PILImage.LANCZOS)
+    out = img.convert("RGB").copy()
+    out.paste(hdr, (0, int(top_margin_pt * scale)), hdr)
+    return out
+
+
+def process_pdf(pdf_bytes, names_to_remove, remove_gs, colors, color_params, dpi,
+                add_header, header_width_frac, header_top_pt):
+    """Full pipeline: overlays -> colours -> header. bytes -> bytes."""
+    data = remove_selected_bytes(pdf_bytes, tuple(sorted(names_to_remove)), remove_gs)
+    if colors:
+        data = rasterize_remove_colors(data, colors, color_params, dpi)
+    if add_header:
+        data = add_header_bytes(data, header_width_frac, header_top_pt)
+    return data
+
+
+def swatch_html(hex_color, label=""):
+    return (f"<div style='display:flex;align-items:center;gap:8px;margin:4px 0'>"
+            f"<div style='width:34px;height:22px;border-radius:4px;border:1px solid #999;"
+            f"background:{hex_color}'></div><code>{label or hex_color}</code></div>")
 
 
 # ==============================
@@ -711,13 +914,14 @@ if page == "📄 SPEC & COA Generator":
 elif page == "🚿 Watermark Remover":
 
     st.title("🚿 Watermark Remover")
-    st.caption("Scan your PDFs to preview every embedded overlay, choose what to remove, then process.")
+    st.caption("Remove embedded logos/watermarks and coloured stamps, check the live preview, then process.")
 
-    if "wm_scan_results" not in st.session_state:
-        st.session_state["wm_scan_results"] = []
-    if "wm_remove_set" not in st.session_state:
-        st.session_state["wm_remove_set"] = set()
+    for _k, _v in {"wm_scan_results": [], "wm_remove_set": set(),
+                   "cr_colors": [], "cr_last_click": None}.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
 
+    # ── ① Upload ──────────────────────────────────────────────────────────
     st.subheader("① Upload PDF(s)")
 
     uploaded_files = st.file_uploader(
@@ -731,19 +935,23 @@ elif page == "🚿 Watermark Remover":
         st.info("Upload one or more PDFs to get started.")
         st.stop()
 
+    # getvalue() always returns the full file, even after earlier reads
+    file_bytes = {f.name: f.getvalue() for f in uploaded_files}
     st.write(f"{len(uploaded_files)} file(s) uploaded.")
 
+    # ── ② Scan ────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("② Scan for Overlays & Images")
+    st.caption("Finds logos and watermarks embedded as separate objects. "
+               "Stamps that are part of a scanned page won't show here — use ④ for those.")
 
     if st.button("🔍 Scan PDFs for embedded elements"):
         combined = {}
 
         with st.spinner("Scanning..."):
-            for uploaded in uploaded_files:
+            for fname, data in file_bytes.items():
                 try:
-                    results = scan_xobjects(uploaded.read())
-                    for item in results:
+                    for item in scan_xobjects(data):
                         name = item["name"]
                         if name not in combined:
                             combined[name] = item.copy()
@@ -754,7 +962,7 @@ elif page == "🚿 Watermark Remover":
                             if combined[name]["thumbnail"] is None and item["thumbnail"]:
                                 combined[name]["thumbnail"] = item["thumbnail"]
                 except Exception as e:
-                    st.warning(f"Could not scan {uploaded.name}: {e}")
+                    st.warning(f"Could not scan {fname}: {e}")
 
         st.session_state["wm_scan_results"] = list(combined.values())
 
@@ -772,10 +980,12 @@ elif page == "🚿 Watermark Remover":
             st.success(f"Found {len(st.session_state['wm_scan_results'])} embedded element(s). "
                        "Review them below and tick what to remove.")
         else:
-            st.warning("No Do-operator XObjects found in these PDFs.")
+            st.warning("No embedded overlay objects found in these PDFs.")
 
     scan_results = st.session_state["wm_scan_results"]
+    remove_gs = False
 
+    # ── ③ Choose overlays ─────────────────────────────────────────────────
     if scan_results:
         st.divider()
         st.subheader("③ Choose What to Remove")
@@ -827,7 +1037,6 @@ elif page == "🚿 Watermark Remover":
 
         st.session_state["wm_remove_set"] = remove_set
 
-        st.divider()
         remove_gs = st.checkbox(
             "Also strip `gs` (graphic state) operators  ⚠️ may affect some page rendering",
             value=False,
@@ -838,102 +1047,250 @@ elif page == "🚿 Watermark Remover":
         if n_selected:
             st.info(f"**{n_selected}** element(s) marked for removal: "
                     + ", ".join(f"`{n}`" for n in sorted(st.session_state["wm_remove_set"])))
+
+    names_to_remove = tuple(sorted(st.session_state["wm_remove_set"])) if scan_results else ()
+
+    # Page shown in the preview (also used to detect stamp colours)
+    preview_ok = fitz is not None
+    if preview_ok:
+        pv_col1, pv_col2 = st.columns([3, 1])
+        with pv_col1:
+            preview_name = st.selectbox("File to preview", list(file_bytes.keys()), key="pv_file")
+        n_pages = pdf_page_count(file_bytes[preview_name])
+        with pv_col2:
+            preview_page = st.number_input("Page", min_value=1, max_value=n_pages, value=1,
+                                           step=1, key="pv_page") - 1
+        base_bytes = remove_selected_bytes(file_bytes[preview_name], names_to_remove, remove_gs)
+        base_img, page_w_pt, page_h_pt = render_page(base_bytes, preview_page)
+        orig_img, _, _ = render_page(file_bytes[preview_name], preview_page)
+    else:
+        st.warning("Preview and colour removal need PyMuPDF. Install it with "
+                   "`py -m pip install pymupdf` and restart the app.")
+
+    # ── ④ Colour removal ──────────────────────────────────────────────────
+    st.divider()
+    st.subheader("④ Remove Coloured Stamps / Marks (optional)")
+
+    colors_on = False
+    color_params = (25, 10, 70)
+    raster_dpi = 300
+
+    if preview_ok:
+        colors_on = st.checkbox("Remove ink colours (red QC seal, blue/purple stamp, signature…)",
+                                value=False, key="cr_enable")
+
+    if colors_on:
+        st.caption("Pages are converted to images for this step, so text in the output "
+                   "won't be selectable. Black text under a stamp is kept.")
+
+        # Suggested colours found on the preview page
+        detected = detect_ink_colors(base_img)
+        st.markdown("**Colours found on this page** — click Add for each stamp colour:")
+        if detected:
+            dcols = st.columns(min(len(detected), 6))
+            for i, (col, c) in enumerate(zip(dcols, detected)):
+                hx = rgb_to_hex(c)
+                with col:
+                    st.markdown(swatch_html(hx), unsafe_allow_html=True)
+                    if st.button("Add", key=f"cr_add_det_{hx}_{i}",
+                                 disabled=hx in st.session_state["cr_colors"]):
+                        st.session_state["cr_colors"].append(hx)
+                        st.rerun()
         else:
-            st.warning("Nothing selected — processing will leave PDFs unchanged.")
+            st.caption("No coloured ink detected on this page.")
 
+        mcol1, mcol2 = st.columns([1, 3])
+        with mcol1:
+            manual = st.color_picker("Or choose a colour", "#d23c3c", key="cr_manual")
+        with mcol2:
+            st.write("")
+            st.write("")
+            if st.button("Add this colour", key="cr_add_manual"):
+                if manual not in st.session_state["cr_colors"]:
+                    st.session_state["cr_colors"].append(manual)
+                st.rerun()
+
+        if streamlit_image_coordinates is not None:
+            st.caption("Tip: you can also click directly on a stamp in the **Original** preview below.")
+        else:
+            st.caption("Tip: `py -m pip install streamlit-image-coordinates` lets you click on "
+                       "the preview to pick a colour.")
+
+        st.markdown("**Colours to remove:**")
+        if st.session_state["cr_colors"]:
+            scols = st.columns(min(len(st.session_state["cr_colors"]), 6))
+            for i, hx in enumerate(list(st.session_state["cr_colors"])):
+                with scols[i % len(scols)]:
+                    st.markdown(swatch_html(hx), unsafe_allow_html=True)
+                    if st.button("✕ Remove", key=f"cr_del_{hx}_{i}"):
+                        st.session_state["cr_colors"].remove(hx)
+                        st.rerun()
+        else:
+            st.info("No colours selected yet.")
+
+        with st.expander("Fine-tune", expanded=False):
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                hue_tol = st.slider("Colour range", 1, 90, 25, key="cr_hue",
+                                    help="Raise if parts of the stamp stay; lower if other colours disappear.")
+            with s2:
+                sat_min = st.slider("Min strength %", 1, 80, 10, key="cr_sat",
+                                    help="Lower to also remove the faint, pale edges of the stamp.")
+            with s3:
+                whiten = st.slider("Whiten %", 30, 100, 70, key="cr_whiten",
+                                   help="Lower if a faint ghost of the stamp remains; "
+                                        "raise if text under the stamp looks thin.")
+            raster_dpi = st.select_slider("Output resolution (dpi)", options=[150, 200, 300, 400],
+                                          value=300, key="cr_dpi",
+                                          help="Higher = sharper but larger files.")
+            color_params = (hue_tol, sat_min, whiten)
+
+    active_colors = [hex_to_rgb(h) for h in st.session_state["cr_colors"]] if colors_on else []
+
+    # ── ⑤ Header ──────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("⑤ Company Header (optional)")
+
+    header_exists = os.path.isfile(HEADER_IMAGE_PATH)
+
+    if not header_exists:
+        st.warning(f"⚠️ `SN_Header.png` not found next to `app.py`. "
+                   "Place the file there to enable this option.")
+
+    add_header = st.checkbox(
+        "Stamp SN company header on every page",
+        value=False,
+        disabled=not header_exists,
+        key="wm_add_header"
+    )
+
+    img_width_pct, top_margin = 98, 10
+    if add_header and header_exists:
+        hcol1, hcol2 = st.columns(2)
+        with hcol1:
+            img_width_pct = st.slider(
+                "Header width (% of page width)",
+                min_value=20, max_value=100, value=98, step=1,
+                key="wm_header_width"
+            )
+        with hcol2:
+            top_margin = st.number_input(
+                "Top margin (pt)",
+                min_value=0, max_value=100, value=10, step=1,
+                key="wm_top_margin"
+            )
+
+    # ── ⑥ Live preview ────────────────────────────────────────────────────
+    if preview_ok:
         st.divider()
-        st.subheader("④ Company Header (optional)")
+        st.subheader("⑥ Preview")
+        st.caption(f"{preview_name} — page {preview_page + 1} of {n_pages}. "
+                   "Change the file or page with the selectors above ④.")
 
-        header_exists = os.path.isfile(HEADER_IMAGE_PATH)
-
-        if not header_exists:
-            st.warning(f"⚠️ `SN_Header.png` not found next to `app.py`. "
-                       "Place the file there to enable this option.")
-
-        add_header = st.checkbox(
-            "Stamp SN company header on every page",
-            value=False,
-            disabled=not header_exists,
-            key="wm_add_header"
-        )
-
-        img_width_pct, top_margin = 98, 10
+        after_img = base_img
+        if active_colors:
+            after_img = remove_colors(after_img, active_colors, *color_params)
         if add_header and header_exists:
-            st.image(HEADER_IMAGE_PATH,
-                     caption="SN_Header.png — will be stamped on every page",
-                     use_container_width=True)
-            hcol1, hcol2 = st.columns(2)
-            with hcol1:
-                img_width_pct = st.slider(
-                    "Header width (% of page width)",
-                    min_value=20, max_value=100, value=98, step=1,
-                    key="wm_header_width"
+            after_img = paste_header(after_img, page_w_pt, PREVIEW_DPI,
+                                     img_width_pct / 100, top_margin)
+
+        pcol1, pcol2 = st.columns(2)
+        with pcol1:
+            st.markdown("**Original**")
+            if colors_on and streamlit_image_coordinates is not None:
+                disp_w = min(PICK_WIDTH, orig_img.width)
+                disp = orig_img.resize((disp_w, int(orig_img.height * disp_w / orig_img.width)))
+                click = streamlit_image_coordinates(
+                    disp, width=disp_w, key=f"cr_pick_{preview_name}_{preview_page}")
+                if click and click != st.session_state["cr_last_click"]:
+                    st.session_state["cr_last_click"] = click
+                    sx = orig_img.width / disp_w
+                    picked = pick_color_at(orig_img, int(click["x"] * sx), int(click["y"] * sx))
+                    if picked is None:
+                        st.toast("That spot isn't coloured ink — click directly on the stamp.")
+                    else:
+                        hx = rgb_to_hex(picked)
+                        if hx not in st.session_state["cr_colors"]:
+                            st.session_state["cr_colors"].append(hx)
+                            st.rerun()
+            else:
+                st.image(orig_img, use_container_width=True)
+        with pcol2:
+            st.markdown("**After processing**")
+            st.image(after_img, use_container_width=True)
+
+        changes = []
+        if names_to_remove: changes.append(f"{len(names_to_remove)} overlay(s) removed")
+        if active_colors:   changes.append(f"{len(active_colors)} colour(s) removed")
+        if add_header and header_exists: changes.append("header added")
+        st.caption("Changes shown: " + (", ".join(changes) if changes else "none yet"))
+
+    # ── ⑦ Process ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("⑦ Process Files")
+
+    if colors_on and not active_colors:
+        st.warning("Colour removal is on but no colours are selected — it will be skipped.")
+
+    if st.button("⚙️ Process Files", type="primary"):
+        results, errors = [], []
+        progress = st.progress(0, text="Processing...")
+
+        for i, (fname, data) in enumerate(file_bytes.items()):
+            try:
+                safe_name   = fname.replace(" ", "_")
+                output_name = f"SN-{safe_name}"
+                output_path = f"outputs/{output_name}"
+
+                out_bytes = process_pdf(
+                    data, names_to_remove, remove_gs,
+                    active_colors, color_params, raster_dpi,
+                    add_header and header_exists, img_width_pct / 100, top_margin,
                 )
-            with hcol2:
-                top_margin = st.number_input(
-                    "Top margin (pt)",
-                    min_value=0, max_value=100, value=10, step=1,
-                    key="wm_top_margin"
+                with open(output_path, "wb") as f:
+                    f.write(out_bytes)
+                results.append((output_name, output_path))
+
+            except Exception as e:
+                errors.append((fname, str(e)))
+
+            progress.progress((i + 1) / len(file_bytes),
+                              text=f"Processed {i + 1}/{len(file_bytes)}")
+
+        progress.empty()
+
+        for name, err in errors:
+            st.error(f"❌ {name}: {err}")
+
+        if results:
+            ops = []
+            if names_to_remove: ops.append(f"{len(names_to_remove)} element(s) removed")
+            if active_colors:   ops.append(f"{len(active_colors)} colour(s) removed")
+            if add_header and header_exists: ops.append("header added")
+            st.success(f"✅ {len(results)} file(s) done" +
+                       (f" ({', '.join(ops)})" if ops else "") + ".")
+
+            if len(results) > 1:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for output_name, output_path in results:
+                        zf.write(output_path, arcname=output_name)
+                zip_buf.seek(0)
+                st.download_button(
+                    f"⬇️ Download All ({len(results)} files) as ZIP", zip_buf,
+                    file_name="SN_processed_pdfs.zip", mime="application/zip",
+                    key="dl_wm_all_zip", type="primary", use_container_width=True,
                 )
 
-        st.divider()
-
-        if st.button("⚙️ Process Files", type="primary"):
-            names_to_remove = st.session_state["wm_remove_set"]
-            results, errors = [], []
-            progress = st.progress(0, text="Processing...")
-
-            for i, uploaded in enumerate(uploaded_files):
-                fname = uploaded.name
-                try:
-                    safe_name   = fname.replace(" ", "_")
-                    output_name = f"SN-{safe_name}"
-                    output_path = f"outputs/{output_name}"
-
-                    remove_selected(
-                        uploaded.read(),
-                        output_path,
-                        names_to_remove=names_to_remove,
-                        remove_gs=remove_gs
+            for output_name, output_path in results:
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        label=f"⬇️ {output_name}",
+                        data=f,
+                        file_name=output_name,
+                        mime="application/pdf",
+                        key=f"dl_{output_name}"
                     )
-
-                    if add_header and header_exists:
-                        headed_path = output_path.replace(".pdf", "_headed.pdf")
-                        add_header_to_pdf(output_path, headed_path,
-                                          img_width_frac=img_width_pct / 100,
-                                          top_margin_pt=top_margin)
-                        os.replace(headed_path, output_path)
-
-                    results.append((output_name, output_path))
-
-                except Exception as e:
-                    errors.append((fname, str(e)))
-
-                progress.progress((i + 1) / len(uploaded_files),
-                                  text=f"Processed {i + 1}/{len(uploaded_files)}")
-
-            progress.empty()
-
-            for name, err in errors:
-                st.error(f"❌ {name}: {err}")
-
-            if results:
-                ops = []
-                if names_to_remove: ops.append(f"{len(names_to_remove)} element(s) removed")
-                if add_header and header_exists: ops.append("header added")
-                st.success(f"✅ {len(results)} file(s) done" +
-                           (f" ({', '.join(ops)})" if ops else "") + ".")
-                st.divider()
-
-                for output_name, output_path in results:
-                    with open(output_path, "rb") as f:
-                        st.download_button(
-                            label=f"⬇️ {output_name}",
-                            data=f,
-                            file_name=output_name,
-                            mime="application/pdf",
-                            key=f"dl_{output_name}"
-                        )
 
 
 # ==============================
