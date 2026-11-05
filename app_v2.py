@@ -616,25 +616,35 @@ def remove_colors(img, targets, hue_tol=25, sat_min=10, whiten=70):
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def detect_ink_colors(img, max_colors=6, min_share=0.0008):
-    """Find the main coloured inks on a page (ignores black/grey/white)."""
+def detect_ink_colors(img, max_colors=8, min_share=0.00005):
+    """
+    Find the coloured inks on a page (ignores black/grey/white).
+    Groups neighbouring hues so a thin stamp still counts as one ink,
+    and keeps even small marks (a stamp may cover well under 0.1% of a page).
+    """
     hsv = np.array(img.convert("HSV")).reshape(-1, 3).astype(np.int32)
     rgb = np.array(img.convert("RGB")).reshape(-1, 3)
-    mask = (hsv[:, 1] >= 64) & (hsv[:, 2] >= 60)
+    mask = (hsv[:, 1] >= 50) & (hsv[:, 2] >= 50)
     if not mask.any():
         return []
-    bins = hsv[mask, 0] * 24 // 256            # 24 hue buckets of 15°
+    nb = 24                                     # hue buckets of 15°
+    bins = hsv[mask, 0] * nb // 256
     cols = rgb[mask]
-    counts = np.bincount(bins, minlength=24)
-    threshold = max(min_share * hsv.shape[0], 25)
+    counts = np.bincount(bins, minlength=nb)
+    threshold = max(min_share * hsv.shape[0], 30)
 
-    found = []
+    found, used = [], set()
     for b in np.argsort(counts)[::-1]:
-        if counts[b] < threshold:
-            break
-        if any(min(abs(int(b) - f), 24 - abs(int(b) - f)) <= 1 for f, _ in found):
-            continue                            # neighbour of an ink we already have
-        found.append((int(b), tuple(int(v) for v in np.median(cols[bins == b], axis=0))))
+        b = int(b)
+        if counts[b] == 0 or b in used:
+            continue
+        group = {(b + k) % nb for k in (-1, 0, 1)} - used   # peak + neighbours
+        total = sum(int(counts[g]) for g in group)
+        used |= group
+        if total < threshold:
+            continue
+        sel = cols[np.isin(bins, list(group))]
+        found.append((total, tuple(int(v) for v in np.median(sel, axis=0))))
         if len(found) >= max_colors:
             break
     return [c for _, c in found]
