@@ -588,22 +588,30 @@ def _grow(mask, r):
     return out
 
 
-def remove_colors(img, targets, hue_tol=25, sat_min=10, whiten=70):
+def remove_colors(img, targets, hue_tol=25, sat_min=10, whiten=75, edge_clean=55):
     """
-    Remove pixels whose hue is close to any target colour.
+    Remove coloured ink (stamps, seals, signatures) while keeping black text under it.
 
-    In the channel where an ink is brightest (red for a red seal, blue for a
-    purple one) the ink nearly vanishes while black text underneath still
-    shows, so matched pixels are replaced by that channel as grey. The stamp
-    disappears and overlapping text survives.
-      hue_tol - hue distance (degrees) still counted as the same ink
-      sat_min - minimum colour strength (%) for a pixel to count as ink
-      whiten  - leftover grey lighter than this (%) becomes pure white
+    Ink separation: each matched pixel is explained as  paper × ink^a × text,
+    where `ink` is the stamp's typical colour and `a` its local density. Solving
+    for `text` per pixel takes the stamp out whether its ink is pale or dense,
+    so no ghost of the letters is left. Removed areas get the page's own paper
+    tone (scans are rarely pure white), and blended/grey pixels along the ink
+    edges are cleaned too.
+      hue_tol    - hue distance (degrees) still counted as the same ink
+      sat_min    - minimum colour strength (%) for a pixel to count as ink
+      whiten     - what's left lighter than this (%) becomes paper
+      edge_clean - along the ink edges, anything lighter than this (%) becomes paper
     """
     rgb = np.array(img.convert("RGB")).astype(np.float32)
     hsv = np.array(img.convert("HSV")).astype(np.int16)
     h, s = hsv[..., 0], hsv[..., 1]
     colored = s >= sat_min * 255 / 100
+
+    paper_px = (rgb.mean(axis=2) > 200) & (s < 15)
+    paper = (np.median(rgb[paper_px], axis=0) if paper_px.sum() > 100
+             else np.array([255, 255, 255], np.float32))
+    edge_px = max(2, int(round(min(img.size) / 900)))     # ~3 px at 300 dpi
     out = rgb.copy()
     tol = hue_tol * 255 / 360
 
@@ -614,14 +622,25 @@ def remove_colors(img, targets, hue_tol=25, sat_min=10, whiten=70):
         core = colored & (d <= tol)
         if not core.any():
             continue
-        match = _grow(core, 1)                  # catch the soft edges of the ink
-        ch = int(np.argmax(color))              # channel where this ink is brightest
-        ref = max(np.percentile(rgb[..., ch][core], 75), 1)
-        gray = np.clip(rgb[..., ch] * (255.0 / ref), 0, 255)
-        gray[gray >= whiten * 255 / 100] = 255
-        out[match] = gray[match][:, None]
 
-    return PILImage.fromarray(out.astype(np.uint8))
+        ink = np.median(rgb[core], axis=0)      # this stamp's typical colour
+        x = np.log(np.clip(ink / paper, 0.02, 0.999))
+        xc = x - x.mean()
+        den = max(float((xc ** 2).sum()), 1e-6)
+        y = np.log(np.clip(rgb[core] / paper, 1 / 255, 1.0))
+        ym = y.mean(axis=1, keepdims=True)
+        a = np.clip(((y - ym) * xc).sum(axis=1) / den, 0, None)    # local ink density
+        k = np.clip(np.exp(ym[:, 0] - a * x.mean()), 0, 1)        # text darkness left
+        val = k[:, None] * paper[None, :]
+        val[k >= whiten / 100] = paper
+        out[core] = val
+
+        edge = _grow(core, edge_px) & ~core
+        e = out[edge]
+        e[e.mean(axis=1) >= edge_clean * 255 / 100] = paper
+        out[edge] = e
+
+    return PILImage.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
 def detect_ink_colors(img, max_colors=8, min_share=0.00005):
@@ -1326,17 +1345,9 @@ elif page == "🚿 Watermark Remover":
 
     # ── left panel: edits in tabs ────────────────────────────────────────
     with left:
-        n_ovl = len(st.session_state["wm_remove_set"])
-        n_wo = len(st.session_state["wo_areas"])
-        n_col = len(st.session_state["cr_colors"])
-        hdr_on = bool(st.session_state.get("wm_add_header"))
+        # Tab labels must never change, otherwise Streamlit jumps back to the first tab
         tab_logo, tab_wo, tab_col, tab_hdr, tab_src = st.tabs([
-            f"🧩 Logos{f' ({n_ovl})' if n_ovl else ''}",
-            f"⬜ White-out{f' ({n_wo})' if n_wo else ''}",
-            f"🎨 Stamps{f' ({n_col})' if n_col else ''}",
-            f"🏷️ Header{' ✓' if hdr_on else ''}",
-            "🔎 Source check",
-        ])
+            "🧩 Logos", "⬜ White-out", "🎨 Stamps", "🏷️ Header", "🔎 Source check"])
 
         # Logos & watermarks ------------------------------------------------
         remove_gs = False
@@ -1438,7 +1449,7 @@ elif page == "🚿 Watermark Remover":
                     st.rerun()
 
         # Stamp colours -----------------------------------------------------
-        color_params = (25, 10, 70)
+        color_params = (25, 10, 75, 55)
         raster_dpi = 300
         with tab_col:
             st.markdown("<div class='sn-hint'>Removes coloured ink — red QC seals, blue/violet stamps, "
@@ -1487,21 +1498,24 @@ elif page == "🚿 Watermark Remover":
                 else:
                     st.caption("None yet — stamp removal is off.")
 
-                with st.expander("Fine-tune"):
-                    s1, s2, s3 = st.columns(3)
+                with st.expander("Fine-tune — if traces of the stamp remain"):
+                    s1, s2 = st.columns(2)
                     with s1:
                         hue_tol = st.slider("Colour range", 1, 90, 25, key="cr_hue",
                                             help="Raise if parts of the stamp stay; lower if other colours disappear.")
+                        whiten = st.slider("Whiten %", 30, 100, 75, key="cr_whiten",
+                                           help="Lower if a faint ghost of the letters remains; "
+                                                "raise if text or lines under the stamp fade.")
                     with s2:
                         sat_min = st.slider("Min strength %", 1, 80, 10, key="cr_sat",
-                                            help="Lower to also remove faint, pale stamp edges.")
-                    with s3:
-                        whiten = st.slider("Whiten %", 30, 100, 70, key="cr_whiten",
-                                           help="Lower if a faint ghost remains; raise if text under the stamp looks thin.")
+                                            help="Lower to also catch pale, washed-out stamp ink.")
+                        edge_clean = st.slider("Edge cleanup %", 20, 95, 55, key="cr_edge",
+                                               help="Lower to remove grey outlines around the stamp letters; "
+                                                    "raise if nearby text gets thinner.")
                     raster_dpi = st.select_slider("Output resolution (dpi)", options=[150, 200, 300, 400],
                                                   value=300, key="cr_dpi",
                                                   help="Higher = sharper but larger files.")
-                    color_params = (hue_tol, sat_min, whiten)
+                    color_params = (hue_tol, sat_min, whiten, edge_clean)
 
         active_colors = [hex_to_rgb(h) for h in st.session_state["cr_colors"]] if preview_ok else []
 
