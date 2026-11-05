@@ -4,3 +4,6 @@ python-docx
 pypdf
 reportlab
 pillow
+numpy
+pymupdf
+streamlit-image-coordinates
