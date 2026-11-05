@@ -6,7 +6,7 @@ import zipfile
 from datetime import datetime
 import re
 
-st.set_page_config(page_title="SN Tools", layout="wide")
+st.set_page_config(page_title="SN Tools", page_icon="🧪", layout="wide")
 
 # ==============================
 # Utility Functions
@@ -1028,14 +1028,42 @@ os.makedirs("outputs", exist_ok=True)
 
 with st.sidebar:
     st.title("🧪 SN Tools")
+    st.caption("Skyherb® internal document tools")
     st.markdown("---")
-    page = st.radio(
-        "Navigate to",
-        options=["🚿 Watermark Remover", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"],
-        label_visibility="collapsed"
-    )
+    _tools = ["🚿 Watermark Remover", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"]
+    _tool_help = ["Clean supplier PDFs: logos, stamps, white-out, header",
+                  "Turn supplier SPEC/COA PDFs into Skyherb Word documents",
+                  "Remove passwords and print/copy restrictions"]
+    try:
+        page = st.radio("Tool", options=_tools, captions=_tool_help,
+                        label_visibility="collapsed", key="nav_tool")
+    except TypeError:   # older Streamlit without captions
+        page = st.radio("Tool", options=_tools, label_visibility="collapsed", key="nav_tool")
     st.markdown("---")
-    st.caption("Skyherb® Internal Tools")
+    st.caption("Files are processed in this session only.")
+
+# Shared look & feel
+st.markdown("""
+<style>
+.block-container {padding-top: 2.2rem; padding-bottom: 3rem;}
+h1 {font-size: 1.85rem !important; margin-bottom: 0.2rem !important;}
+h3 {font-size: 1.15rem !important;}
+.stTabs [data-baseweb="tab-list"] {gap: 4px; flex-wrap: wrap;}
+.stTabs [data-baseweb="tab"] {font-weight: 600; padding: 6px 12px; border-radius: 8px 8px 0 0;}
+div[data-testid="stExpander"] details {border-radius: 10px;}
+.sn-chip {display: inline-block; padding: 2px 10px; margin: 2px 6px 2px 0; border-radius: 999px;
+          font-size: 0.82rem; background: rgba(14,140,114,0.10); color: #0b6e5a;
+          border: 1px solid rgba(14,140,114,0.35);}
+.sn-chip.muted {background: rgba(128,128,128,0.08); color: #777; border-color: rgba(128,128,128,0.3);}
+.sn-hint {font-size: 0.86rem; color: #6b6b6b; margin: -0.3rem 0 0.6rem 0;}
+</style>""", unsafe_allow_html=True)
+
+
+def chips(items, empty="No changes yet"):
+    if not items:
+        return f"<span class='sn-chip muted'>{empty}</span>"
+    return "".join(f"<span class='sn-chip'>{i}</span>" for i in items)
+
 
 
 # ==============================
@@ -1154,431 +1182,383 @@ if page == "📄 SPEC & COA Generator":
 
 elif page == "🚿 Watermark Remover":
 
-    st.title("🚿 Watermark Remover")
-    st.caption("Remove logos, watermarks and coloured stamps, white out any area, and add your header. "
-               "The preview on the right updates with every change.")
-
+    # ── state ─────────────────────────────────────────────────────────────
     for _k, _v in {"wm_scan_results": [], "wm_remove_set": set(), "cr_colors": [],
-                   "pv_last_event": None, "wo_areas": []}.items():
+                   "pv_last_event": None, "wo_areas": [], "pv_page": 1}.items():
         if _k not in st.session_state:
             st.session_state[_k] = _v
 
-    # Keep the preview column pinned on screen while the controls scroll
+    def _wm_reset():
+        st.session_state["wm_remove_set"] = set()
+        st.session_state["wo_areas"] = []
+        st.session_state["cr_colors"] = []
+        st.session_state["wm_results"] = None
+        for k in [k for k in st.session_state.keys() if str(k).startswith("chk_")]:
+            del st.session_state[k]
+
+    def _pv_step(delta, n):
+        st.session_state["pv_page"] = min(max(1, int(st.session_state.get("pv_page", 1)) + delta), n)
+
+    def _pv_file_changed():
+        st.session_state["pv_page"] = 1
+
+    def _set_all_overlays(names, value):
+        for n in names:
+            st.session_state[f"chk_{n}"] = value
+
+    # Sticky preview column
     st.markdown("""
         <style>
         div[data-testid="stColumn"]:has(.st-key-wm_preview_panel),
         div[data-testid="column"]:has(.st-key-wm_preview_panel) {
             position: sticky; top: 3.75rem; align-self: flex-start;
-            max-height: calc(100vh - 4.5rem); overflow-y: auto;
+            max-height: calc(100vh - 4.5rem); overflow-y: auto; padding-right: 6px;
+        }
+        .st-key-wm_preview_panel [data-testid="stImage"] img,
+        .st-key-wm_preview_panel iframe {
+            border: 1px solid rgba(128,128,128,0.35); border-radius: 4px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08); background: #fff;
         }
         </style>""", unsafe_allow_html=True)
 
-    # ── ① Upload (full width) ─────────────────────────────────────────────
-    st.subheader("① Upload PDF(s)")
+    # ── header ────────────────────────────────────────────────────────────
+    t1, t2 = st.columns([5, 1])
+    with t1:
+        st.title("🚿 Watermark Remover")
+        st.markdown("<div class='sn-hint'>Upload → choose edits in the tabs → check the live preview "
+                    "→ process & download.</div>", unsafe_allow_html=True)
+    with t2:
+        st.write("")
+        st.button("↺ Reset all edits", on_click=_wm_reset, key="wm_reset",
+                  help="Clear removed logos, white-out boxes and stamp colours.")
+
     uploaded_files = st.file_uploader(
-        "Upload one or more PDF files",
-        type="pdf",
-        accept_multiple_files=True,
-        key="wm_uploader"
-    )
+        "Upload one or more PDF files", type="pdf", accept_multiple_files=True,
+        key="wm_uploader", label_visibility="collapsed")
 
     if not uploaded_files:
-        st.info("Upload one or more PDFs to get started.")
+        st.info("⬆️ Upload one or more PDFs to get started. You can drop several files at once.")
         st.stop()
 
     # getvalue() always returns the full file, even after earlier reads
     file_bytes = {f.name: f.getvalue() for f in uploaded_files}
+    upload_sig = tuple((n, len(b)) for n, b in file_bytes.items())
     preview_ok = fitz is not None
 
-    left, right = st.columns([1.15, 1], gap="large")
+    # ── auto-scan for embedded logos / watermarks when the uploads change ─
+    if st.session_state.get("wm_scan_sig") != upload_sig:
+        combined, scan_errors = {}, []
+        with st.spinner("Scanning for embedded logos & watermarks…"):
+            for fname, data in file_bytes.items():
+                try:
+                    for item in scan_xobjects(data):
+                        name = item["name"]
+                        if name not in combined:
+                            combined[name] = item.copy()
+                        else:
+                            combined[name]["pages"] = sorted(set(combined[name]["pages"] + item["pages"]))
+                            if combined[name]["thumbnail"] is None and item["thumbnail"]:
+                                combined[name]["thumbnail"] = item["thumbnail"]
+                except Exception as e:
+                    scan_errors.append(f"{fname}: {e}")
+        st.session_state["wm_scan_results"] = list(combined.values())
+        wm_hints = {"wm", "watermark", "mark", "stamp", "logo", "bg", "background"}
+        st.session_state["wm_remove_set"] = {
+            it["name"] for it in combined.values()
+            if it["subtype"] == "Form" or any(h in it["name"].lstrip("/").lower() for h in wm_hints)}
+        for k in [k for k in st.session_state.keys() if str(k).startswith("chk_")]:
+            del st.session_state[k]
+        st.session_state["wm_scan_errors"] = scan_errors
+        st.session_state["wm_scan_sig"] = upload_sig
+        st.session_state["wm_results"] = None
+        st.session_state["pv_page"] = 1
 
-    # ── Right panel, part 1: which page to preview ───────────────────────
+    for err in st.session_state.get("wm_scan_errors", []):
+        st.warning(f"Could not scan {err}")
+
+    scan_results = st.session_state["wm_scan_results"]
+    if preview_ok:
+        pages_info = ", ".join(f"{n} ({pdf_page_count(b)} p.)" for n, b in file_bytes.items())
+    else:
+        pages_info = ", ".join(file_bytes.keys())
+    st.caption(f"📎 {len(file_bytes)} file(s): {pages_info}")
+
+    left, right = st.columns([1.05, 1], gap="large")
+
+    # ── right panel, part 1: preview selectors ───────────────────────────
     with right:
         try:
             panel = st.container(key="wm_preview_panel")   # key -> CSS hook for the sticky panel
-        except TypeError:                                  # older Streamlit: no sticky panel
+        except TypeError:
             panel = st.container()
     with panel:
         st.subheader("👁️ Live Preview")
         if preview_ok:
-            pv1, pv2 = st.columns([3, 1])
-            with pv1:
-                preview_name = st.selectbox("File", list(file_bytes.keys()), key="pv_file")
+            if len(file_bytes) > 1:
+                preview_name = st.selectbox("File", list(file_bytes.keys()), key="pv_file",
+                                            on_change=_pv_file_changed, label_visibility="collapsed")
+            else:
+                preview_name = next(iter(file_bytes))
             n_pages = pdf_page_count(file_bytes[preview_name])
-            with pv2:
-                preview_page = st.number_input("Page", min_value=1, max_value=n_pages, value=1,
-                                               step=1, key="pv_page") - 1
+            if st.session_state["pv_page"] > n_pages:
+                st.session_state["pv_page"] = 1
+            if n_pages > 1:
+                n1, n2, n3, n4 = st.columns([1, 2, 1, 3])
+                with n1:
+                    st.button("◀", key="pv_prev", on_click=_pv_step, args=(-1, n_pages),
+                              disabled=st.session_state["pv_page"] <= 1)
+                with n2:
+                    st.number_input("Page", min_value=1, max_value=n_pages, step=1, key="pv_page",
+                                    label_visibility="collapsed")
+                with n3:
+                    st.button("▶", key="pv_next", on_click=_pv_step, args=(1, n_pages),
+                              disabled=st.session_state["pv_page"] >= n_pages)
+                with n4:
+                    st.caption(f"of {n_pages} pages")
+            preview_page = int(st.session_state["pv_page"]) - 1
         else:
-            st.warning(
-                "Preview, colour removal and white-out need PyMuPDF, which isn't available to the "
-                "Python running this app. Add `pymupdf` to requirements.txt (or run the command "
-                "below locally), then restart the app."
-            )
+            st.warning("Preview, stamp removal and white-out need PyMuPDF, which isn't available to "
+                       "the Python running this app. Add `pymupdf` to requirements.txt (or run the "
+                       "command below locally) and restart the app.")
             st.code(f'"{sys.executable}" -m pip install pymupdf numpy', language="bash")
             if FITZ_ERROR:
                 st.caption(f"Import error: {FITZ_ERROR}")
 
-    # ── Left panel: all controls ─────────────────────────────────────────
+    # ── left panel: edits in tabs ────────────────────────────────────────
     with left:
-        st.write(f"{len(uploaded_files)} file(s) uploaded.")
+        n_ovl = len(st.session_state["wm_remove_set"])
+        n_wo = len(st.session_state["wo_areas"])
+        n_col = len(st.session_state["cr_colors"])
+        hdr_on = bool(st.session_state.get("wm_add_header"))
+        tab_logo, tab_wo, tab_col, tab_hdr, tab_src = st.tabs([
+            f"🧩 Logos{f' ({n_ovl})' if n_ovl else ''}",
+            f"⬜ White-out{f' ({n_wo})' if n_wo else ''}",
+            f"🎨 Stamps{f' ({n_col})' if n_col else ''}",
+            f"🏷️ Header{' ✓' if hdr_on else ''}",
+            "🔎 Source check",
+        ])
 
-        # ② Scan
-        st.subheader("② Embedded Logos & Watermarks")
-        st.caption("Finds logos and watermarks stored as separate objects. Stamps that are part "
-                   "of a scanned page won't show here — use ③ or ④ for those.")
-
-        if st.button("🔍 Scan PDFs for embedded elements"):
-            combined = {}
-            with st.spinner("Scanning..."):
-                for fname, data in file_bytes.items():
-                    try:
-                        for item in scan_xobjects(data):
-                            name = item["name"]
-                            if name not in combined:
-                                combined[name] = item.copy()
-                            else:
-                                combined[name]["pages"] = sorted(
-                                    set(combined[name]["pages"] + item["pages"]))
-                                if combined[name]["thumbnail"] is None and item["thumbnail"]:
-                                    combined[name]["thumbnail"] = item["thumbnail"]
-                    except Exception as e:
-                        st.warning(f"Could not scan {fname}: {e}")
-
-            st.session_state["wm_scan_results"] = list(combined.values())
-            wm_hints = {"wm", "watermark", "mark", "stamp", "logo", "bg", "background"}
-            st.session_state["wm_remove_set"] = {
-                it["name"] for it in st.session_state["wm_scan_results"]
-                if it["subtype"] == "Form" or any(h in it["name"].lstrip("/").lower() for h in wm_hints)
-            }
-            if st.session_state["wm_scan_results"]:
-                st.success(f"Found {len(st.session_state['wm_scan_results'])} embedded element(s). "
-                           "Tick what to remove.")
-            else:
-                st.warning("No embedded overlay objects found in these PDFs.")
-
-        scan_results = st.session_state["wm_scan_results"]
+        # Logos & watermarks ------------------------------------------------
         remove_gs = False
+        with tab_logo:
+            st.markdown("<div class='sn-hint'>Logos and watermarks stored as separate objects in the "
+                        "PDF. Ticked items are removed cleanly — the text stays selectable.</div>",
+                        unsafe_allow_html=True)
+            if not scan_results:
+                st.info("No embedded logos or watermarks found. A stamp or logo that's part of a "
+                        "scanned page can be removed in the **Stamps** or **White-out** tab.")
+            else:
+                all_names = [it["name"] for it in scan_results]
+                b1, b2, _ = st.columns([1, 1, 2])
+                with b1:
+                    _stretch_call(st.button, "☑ Tick all", key="ovl_all",
+                                  on_click=_set_all_overlays, args=(all_names, True))
+                with b2:
+                    _stretch_call(st.button, "☐ Untick all", key="ovl_none",
+                                  on_click=_set_all_overlays, args=(all_names, False))
 
-        if scan_results:
-            COLS = 3
-            remove_set = st.session_state["wm_remove_set"].copy()
-            for row_start in range(0, len(scan_results), COLS):
-                cols = st.columns(COLS)
-                for col, item in zip(cols, scan_results[row_start: row_start + COLS]):
-                    with col:
-                        name, subtype, pages, thumb = (item["name"], item["subtype"],
-                                                       item["pages"], item["thumbnail"])
-                        if thumb:
-                            _stretch_call(st.image, thumb)
-                        else:
-                            icon, label = ("📐", "Vector / Form") if subtype == "Form" else ("❓", subtype)
-                            st.markdown(
-                                f"<div style='background:#f0f0f0;border-radius:6px;"
-                                f"padding:28px 0;text-align:center;font-size:28px'>"
-                                f"{icon}<br><small style='font-size:11px;color:#555'>{label}</small></div>",
-                                unsafe_allow_html=True)
-                        page_str = (f"p.{pages[0]}" if len(pages) == 1
-                                    else f"p.{pages[0]}–{pages[-1]}" if pages == list(range(pages[0], pages[-1] + 1))
-                                    else f"{len(pages)} pages")
-                        st.caption(f"`{name}` · {subtype} · {page_str}")
-                        if st.checkbox("Remove", value=(name in remove_set), key=f"chk_{name}"):
-                            remove_set.add(name)
-                        else:
-                            remove_set.discard(name)
-            st.session_state["wm_remove_set"] = remove_set
-
-            remove_gs = st.checkbox(
-                "Also strip `gs` (graphic state) operators  ⚠️ may affect some page rendering",
-                value=False, key="wm_remove_gs")
+                COLS = 3
+                remove_set = set()
+                for row_start in range(0, len(scan_results), COLS):
+                    cols = st.columns(COLS)
+                    for col, item in zip(cols, scan_results[row_start: row_start + COLS]):
+                        with col:
+                            name, subtype, pages, thumb = (item["name"], item["subtype"],
+                                                           item["pages"], item["thumbnail"])
+                            with st.container(border=True):
+                                if thumb:
+                                    _stretch_call(st.image, thumb)
+                                else:
+                                    icon, label = ("📐", "Vector / Form") if subtype == "Form" else ("❓", subtype)
+                                    st.markdown(
+                                        f"<div style='background:rgba(128,128,128,0.08);border-radius:6px;"
+                                        f"padding:22px 0;text-align:center;font-size:26px'>{icon}<br>"
+                                        f"<small style='font-size:11px;color:#777'>{label}</small></div>",
+                                        unsafe_allow_html=True)
+                                page_str = (f"p.{pages[0]}" if len(pages) == 1
+                                            else f"p.{pages[0]}–{pages[-1]}" if pages == list(range(pages[0], pages[-1] + 1))
+                                            else f"{len(pages)} pages")
+                                key = f"chk_{name}"
+                                if key not in st.session_state:
+                                    st.session_state[key] = name in st.session_state["wm_remove_set"]
+                                if st.checkbox(f"Remove · {page_str}", key=key, help=f"{name} · {subtype}"):
+                                    remove_set.add(name)
+                st.session_state["wm_remove_set"] = remove_set
+                with st.expander("Advanced"):
+                    remove_gs = st.checkbox(
+                        "Also strip `gs` (graphic state) operators — can remove stubborn transparent "
+                        "watermarks, but may affect page rendering", value=False, key="wm_remove_gs")
 
         names_to_remove = tuple(sorted(st.session_state["wm_remove_set"])) if scan_results else ()
 
-        # Preview base image (after overlays + white-out), used for colour detection too
+        # Preview base image (after overlays + white-out)
         if preview_ok:
             base_bytes = remove_selected_bytes(file_bytes[preview_name], names_to_remove, remove_gs)
             base_img, page_w_pt, page_h_pt = render_page(base_bytes, preview_page)
             page_boxes = areas_for(st.session_state["wo_areas"], preview_name, preview_page)
             wo_img = whiteout_image(base_img, page_boxes)
 
-        # ③ White out areas
-        st.divider()
-        st.subheader("③ White Out Areas")
-        if not preview_ok:
-            st.caption("Needs PyMuPDF — see the message on the right.")
-        elif streamlit_image_coordinates is None:
-            st.warning("Drawing on the preview needs one more package: add "
-                       "`streamlit-image-coordinates` to requirements.txt and restart the app.")
-        else:
-            st.caption("Choose **White out an area** above the preview, then drag a box over any "
-                       "text, logo or image. It's covered with white and removed from the PDF.")
-        wo_scope = st.radio(
-            "New boxes apply to",
-            ["This page only", "All pages of this file", "All pages of all files"],
-            horizontal=True, key="wo_scope",
-            help="Use 'All pages of all files' for a logo that sits in the same spot on every document.")
+        draw_ok = preview_ok and streamlit_image_coordinates is not None
 
-        if st.session_state["wo_areas"]:
-            for i, a in enumerate(list(st.session_state["wo_areas"])):
-                fkey = "*" if a["file"] == "*" else "f"
-                pkey = "*" if a["page"] == "*" else "p"
-                where = (f"{a['file']} p.{a['page'] + 1}" if fkey == "f" and pkey == "p"
-                         else f"{a['file']} — all pages" if fkey == "f"
-                         else "all files — all pages")
-                c1, c2 = st.columns([5, 1])
-                with c1:
+        # White-out ---------------------------------------------------------
+        with tab_wo:
+            st.markdown("<div class='sn-hint'>Cover any text, logo or image with white. What's under "
+                        "the box is deleted from the PDF, not just hidden.</div>", unsafe_allow_html=True)
+            if not preview_ok:
+                st.caption("Needs PyMuPDF — see the message in the preview panel.")
+            elif not draw_ok:
+                st.warning("Drawing on the preview needs `streamlit-image-coordinates` in "
+                           "requirements.txt. Restart the app after adding it.")
+            else:
+                st.markdown("**How:** in the preview, switch to **⬜ White out**, then drag a box.")
+            wo_scope = st.radio(
+                "New boxes apply to",
+                ["This page only", "All pages of this file", "All pages of all files"],
+                horizontal=True, key="wo_scope",
+                help="'All pages of all files' is handy for a logo in the same spot on every document.")
+            if st.session_state["wo_areas"]:
+                st.markdown("**Boxes**")
+                for i, a in enumerate(list(st.session_state["wo_areas"])):
+                    where = (f"{a['file']} · p.{a['page'] + 1}" if a["file"] != "*" and a["page"] != "*"
+                             else f"{a['file']} · all pages" if a["file"] != "*"
+                             else "All files · all pages")
                     x0, y0, x1, y1 = a["box"]
-                    st.caption(f"Box {i + 1}: {where} · {int((x1 - x0) * 100)}% × {int((y1 - y0) * 100)}% "
-                               f"of the page")
-                with c2:
-                    if st.button("✕", key=f"wo_del_{i}"):
-                        st.session_state["wo_areas"].pop(i)
-                        st.rerun()
-            if st.button("Clear all white-out boxes", key="wo_clear"):
-                st.session_state["wo_areas"] = []
-                st.rerun()
-        else:
-            st.caption("No white-out boxes yet.")
+                    c1, c2 = st.columns([6, 1])
+                    with c1:
+                        st.markdown(f"<span class='sn-chip'>#{i + 1}</span> {where} "
+                                    f"<span style='color:#888;font-size:0.82rem'>· "
+                                    f"{int((x1 - x0) * 100)}% × {int((y1 - y0) * 100)}% of page</span>",
+                                    unsafe_allow_html=True)
+                    with c2:
+                        if st.button("✕", key=f"wo_del_{i}", help="Delete this box"):
+                            st.session_state["wo_areas"].pop(i)
+                            st.rerun()
+                if st.button("Clear all boxes", key="wo_clear"):
+                    st.session_state["wo_areas"] = []
+                    st.rerun()
 
-        # ④ Colour removal
-        st.divider()
-        st.subheader("④ Remove Coloured Stamps / Marks")
-        colors_on = False
+        # Stamp colours -----------------------------------------------------
         color_params = (25, 10, 70)
         raster_dpi = 300
+        with tab_col:
+            st.markdown("<div class='sn-hint'>Removes coloured ink — red QC seals, blue/violet stamps, "
+                        "signatures — while keeping black text underneath.</div>", unsafe_allow_html=True)
+            if not preview_ok:
+                st.caption("Needs PyMuPDF — see the message in the preview panel.")
+            else:
+                detected = [rgb_to_hex(c) for c in detect_ink_colors(wo_img)]
+                detected = [h for h in detected if h not in st.session_state["cr_colors"]]
+                st.markdown("**1. Add the stamp's colour**")
+                if detected:
+                    st.caption("Colours found on this page:")
+                    dcols = st.columns(min(len(detected), 4))
+                    for i, hx in enumerate(detected):
+                        with dcols[i % len(dcols)]:
+                            st.markdown(swatch_html(hx), unsafe_allow_html=True)
+                            if st.button("＋ Add", key=f"cr_add_det_{hx}_{i}"):
+                                st.session_state["cr_colors"].append(hx)
+                                st.rerun()
+                else:
+                    st.caption("No other coloured ink found on this page.")
+                m1, m2 = st.columns([1, 2])
+                with m1:
+                    manual = st.color_picker("Or pick any colour", "#7a4fc0", key="cr_manual")
+                with m2:
+                    st.write("")
+                    st.write("")
+                    if st.button("＋ Add this colour", key="cr_add_manual"):
+                        if manual not in st.session_state["cr_colors"]:
+                            st.session_state["cr_colors"].append(manual)
+                        st.rerun()
+                if draw_ok:
+                    st.caption("…or switch the preview to **🎨 Pick colour** and click on the stamp.")
+
+                st.markdown("**2. Colours being removed**")
+                if st.session_state["cr_colors"]:
+                    scols = st.columns(min(len(st.session_state["cr_colors"]), 4))
+                    for i, hx in enumerate(list(st.session_state["cr_colors"])):
+                        with scols[i % len(scols)]:
+                            st.markdown(swatch_html(hx), unsafe_allow_html=True)
+                            if st.button("✕ Remove", key=f"cr_del_{hx}_{i}"):
+                                st.session_state["cr_colors"].remove(hx)
+                                st.rerun()
+                    st.caption("ℹ️ With stamp removal on, pages are saved as images, so their text "
+                               "won't be selectable.")
+                else:
+                    st.caption("None yet — stamp removal is off.")
+
+                with st.expander("Fine-tune"):
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        hue_tol = st.slider("Colour range", 1, 90, 25, key="cr_hue",
+                                            help="Raise if parts of the stamp stay; lower if other colours disappear.")
+                    with s2:
+                        sat_min = st.slider("Min strength %", 1, 80, 10, key="cr_sat",
+                                            help="Lower to also remove faint, pale stamp edges.")
+                    with s3:
+                        whiten = st.slider("Whiten %", 30, 100, 70, key="cr_whiten",
+                                           help="Lower if a faint ghost remains; raise if text under the stamp looks thin.")
+                    raster_dpi = st.select_slider("Output resolution (dpi)", options=[150, 200, 300, 400],
+                                                  value=300, key="cr_dpi",
+                                                  help="Higher = sharper but larger files.")
+                    color_params = (hue_tol, sat_min, whiten)
+
+        active_colors = [hex_to_rgb(h) for h in st.session_state["cr_colors"]] if preview_ok else []
+
+        # Header ------------------------------------------------------------
+        with tab_hdr:
+            header_exists = os.path.isfile(HEADER_IMAGE_PATH)
+            st.markdown("<div class='sn-hint'>Places the SN company header at the top of every page.</div>",
+                        unsafe_allow_html=True)
+            if not header_exists:
+                st.warning("⚠️ `SN_Header.png` not found next to `app.py`. Add it to the repo to enable this.")
+            add_header = st.toggle("Add SN company header", value=False,
+                                   disabled=not header_exists, key="wm_add_header")
+            img_width_pct, top_margin = 98, 10
+            if add_header and header_exists:
+                hcol1, hcol2 = st.columns(2)
+                with hcol1:
+                    img_width_pct = st.slider("Width (% of page)", 20, 100, 98, 1, key="wm_header_width")
+                with hcol2:
+                    top_margin = st.number_input("Top margin (pt)", 0, 100, 10, 1, key="wm_top_margin")
+
+        # Source check ------------------------------------------------------
+        with tab_src:
+            st.markdown("<div class='sn-hint'>Flags spots that may reveal the manufacturer or supplier "
+                        "(company names, “manufactured by”, phone/fax, email, website, address, logos) "
+                        "so you can review before sending. Nothing is changed automatically.</div>",
+                        unsafe_allow_html=True)
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                ignore_text = st.text_area("Our own names / address (ignored)",
+                                           "Skyherb, Loker Ave, Carlsbad, CA92010", height=90,
+                                           key="si_ignore", help="Comma-separated.")
+            with sc2:
+                watch_text = st.text_area("Supplier names to look for", "", height=90, key="si_watch",
+                                          placeholder="e.g. Xinhua, Dae Hyung",
+                                          help="Comma-separated. Always flagged wherever they appear.")
+            ignore_terms, watch_terms = parse_terms(ignore_text), parse_terms(watch_text)
+            si_highlight = st.toggle("Highlight flagged spots on the preview", value=True, key="si_hl")
+            if pytesseract is None:
+                st.caption("Scanned pages can only be checked by eye. To check them automatically, add "
+                           "`pytesseract` to requirements.txt and `tesseract-ocr` to packages.txt.")
+
+    # ── right panel, part 2: live result + export ────────────────────────
+    with panel:
+        changes = []
+        if names_to_remove: changes.append(f"🧩 {len(names_to_remove)} logo(s) removed")
+        if preview_ok and st.session_state["wo_areas"]:
+            changes.append(f"⬜ {len(st.session_state['wo_areas'])} white-out box(es)")
+        if active_colors: changes.append(f"🎨 {len(active_colors)} stamp colour(s)")
+        if add_header and header_exists: changes.append("🏷️ header")
 
         if preview_ok:
-            colors_on = st.checkbox("Remove ink colours (red QC seal, blue/purple stamp, signature…)",
-                                    value=False, key="cr_enable")
-        if colors_on:
-            st.caption("Pages are converted to images for this step, so text in the output won't "
-                       "be selectable. Black text under a stamp is kept.")
-
-            detected = detect_ink_colors(wo_img)
-            st.markdown("**Colours found on this page** — Add each stamp colour:")
-            if detected:
-                dcols = st.columns(min(len(detected), 4))
-                for i, c in enumerate(detected):
-                    hx = rgb_to_hex(c)
-                    with dcols[i % len(dcols)]:
-                        st.markdown(swatch_html(hx), unsafe_allow_html=True)
-                        if st.button("Add", key=f"cr_add_det_{hx}_{i}",
-                                     disabled=hx in st.session_state["cr_colors"]):
-                            st.session_state["cr_colors"].append(hx)
-                            st.rerun()
-            else:
-                st.caption("No coloured ink detected on this page.")
-
-            mcol1, mcol2 = st.columns([1, 2])
-            with mcol1:
-                manual = st.color_picker("Or choose a colour", "#7a4fc0", key="cr_manual")
-            with mcol2:
-                st.write("")
-                st.write("")
-                if st.button("Add this colour", key="cr_add_manual"):
-                    if manual not in st.session_state["cr_colors"]:
-                        st.session_state["cr_colors"].append(manual)
-                    st.rerun()
-            if streamlit_image_coordinates is not None:
-                st.caption("Tip: choose **Pick a stamp colour** above the preview and click on the stamp.")
-
-            st.markdown("**Colours to remove:**")
-            if st.session_state["cr_colors"]:
-                scols = st.columns(min(len(st.session_state["cr_colors"]), 4))
-                for i, hx in enumerate(list(st.session_state["cr_colors"])):
-                    with scols[i % len(scols)]:
-                        st.markdown(swatch_html(hx), unsafe_allow_html=True)
-                        if st.button("✕ Remove", key=f"cr_del_{hx}_{i}"):
-                            st.session_state["cr_colors"].remove(hx)
-                            st.rerun()
-            else:
-                st.info("No colours selected yet.")
-
-            with st.expander("Fine-tune", expanded=False):
-                s1, s2, s3 = st.columns(3)
-                with s1:
-                    hue_tol = st.slider("Colour range", 1, 90, 25, key="cr_hue",
-                                        help="Raise if parts of the stamp stay; lower if other colours disappear.")
-                with s2:
-                    sat_min = st.slider("Min strength %", 1, 80, 10, key="cr_sat",
-                                        help="Lower to also remove the faint, pale edges of the stamp.")
-                with s3:
-                    whiten = st.slider("Whiten %", 30, 100, 70, key="cr_whiten",
-                                       help="Lower if a faint ghost of the stamp remains; "
-                                            "raise if text under the stamp looks thin.")
-                raster_dpi = st.select_slider("Output resolution (dpi)", options=[150, 200, 300, 400],
-                                              value=300, key="cr_dpi",
-                                              help="Higher = sharper but larger files.")
-                color_params = (hue_tol, sat_min, whiten)
-
-        active_colors = [hex_to_rgb(h) for h in st.session_state["cr_colors"]] if colors_on else []
-
-        # ⑤ Header
-        st.divider()
-        st.subheader("⑤ Company Header")
-        header_exists = os.path.isfile(HEADER_IMAGE_PATH)
-        if not header_exists:
-            st.warning("⚠️ `SN_Header.png` not found next to `app.py`. "
-                       "Place the file there to enable this option.")
-        add_header = st.checkbox("Stamp SN company header on every page", value=False,
-                                 disabled=not header_exists, key="wm_add_header")
-        img_width_pct, top_margin = 98, 10
-        if add_header and header_exists:
-            hcol1, hcol2 = st.columns(2)
-            with hcol1:
-                img_width_pct = st.slider("Header width (% of page width)", 20, 100, 98, 1,
-                                          key="wm_header_width")
-            with hcol2:
-                top_margin = st.number_input("Top margin (pt)", 0, 100, 10, 1, key="wm_top_margin")
-
-        # ⑥ Source-info check (flags only, changes nothing)
-        st.divider()
-        st.subheader("⑥ Source-Info Check")
-        st.caption("Flags spots that may reveal the manufacturer or supplier — company names, "
-                   "\"manufactured by\", phone/fax, email, website, address, logos — so you can "
-                   "review before sending to a customer. Nothing is changed automatically.")
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            ignore_text = st.text_area("Our own names / address (ignored)",
-                                       "Skyherb, Loker Ave, Carlsbad, CA92010", height=80,
-                                       key="si_ignore", help="Comma-separated. Lines containing these are not flagged.")
-        with sc2:
-            watch_text = st.text_area("Supplier names to look for (optional)", "", height=80,
-                                      key="si_watch", placeholder="e.g. Xinhua, Dae Hyung",
-                                      help="Comma-separated. Always flagged wherever they appear.")
-        ignore_terms, watch_terms = parse_terms(ignore_text), parse_terms(watch_text)
-        si_highlight = st.checkbox("Highlight flagged spots on the preview", value=True, key="si_hl")
-        if pytesseract is None:
-            st.caption("Scanned pages (no text layer) can only be checked by eye. To check them "
-                       "automatically, add `pytesseract` to requirements.txt and `tesseract-ocr` "
-                       "to packages.txt.")
-
-        # ⑦ Process
-        st.divider()
-        st.subheader("⑦ Process Files")
-        if colors_on and not active_colors:
-            st.warning("Colour removal is on but no colours are selected — it will be skipped.")
-
-        # Results live in session_state so the download buttons survive reruns
-        upload_sig = tuple((n, len(b)) for n, b in file_bytes.items())
-        if st.session_state.get("wm_results_sig") != upload_sig:
-            st.session_state["wm_results"] = None
-
-        if st.button("⚙️ Process Files", type="primary"):
-            results, errors, reports = [], [], {}
-            progress = st.progress(0, text="Processing...")
-            for i, (fname, data) in enumerate(file_bytes.items()):
-                try:
-                    output_name = f"SN-{fname.replace(' ', '_')}"
-                    out_bytes, text_stage, image_stage = process_pdf(
-                        data, names_to_remove, remove_gs,
-                        active_colors, color_params, raster_dpi,
-                        add_header and header_exists, img_width_pct / 100, top_margin,
-                        fname=fname, areas=st.session_state["wo_areas"] if preview_ok else [],
-                        return_stages=True,
-                    )
-                    with open(f"outputs/{output_name}", "wb") as f:
-                        f.write(out_bytes)
-                    results.append((output_name, out_bytes))
-                    if preview_ok:
-                        try:
-                            reports[output_name] = check_pdf(
-                                text_stage, ignore_terms, watch_terms,
-                                image_stage if active_colors else None)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    errors.append((fname, str(e)))
-                progress.progress((i + 1) / len(file_bytes),
-                                  text=f"Processed {i + 1}/{len(file_bytes)}")
-            progress.empty()
-
-            ops = []
-            if names_to_remove: ops.append(f"{len(names_to_remove)} element(s) removed")
-            if st.session_state["wo_areas"] and preview_ok:
-                ops.append(f"{len(st.session_state['wo_areas'])} area(s) whited out")
-            if active_colors: ops.append(f"{len(active_colors)} colour(s) removed")
-            if add_header and header_exists: ops.append("header added")
-
-            zip_bytes = None
-            if len(results) > 1:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for output_name, out_bytes in results:
-                        zf.writestr(output_name, out_bytes)
-                zip_bytes = zip_buf.getvalue()
-
-            st.session_state["wm_results"] = {"files": results, "errors": errors,
-                                              "ops": ops, "zip": zip_bytes, "reports": reports}
-            st.session_state["wm_results_sig"] = upload_sig
-
-        res = st.session_state.get("wm_results")
-        if res:
-            for name, err in res["errors"]:
-                st.error(f"❌ {name}: {err}")
-            files = res["files"]
-            if files:
-                st.success(f"✅ {len(files)} file(s) done" +
-                           (f" ({', '.join(res['ops'])})" if res["ops"] else "") + ".")
-
-                reports = res.get("reports") or {}
-                if reports:
-                    flagged = []
-                    for out_name, rep_ in reports.items():
-                        total, parts, imgs, scanned = summarize_report(rep_)
-                        bits = []
-                        if total:
-                            bits.append(f"**{total} spot(s)** with possible company/source info ({', '.join(parts)})")
-                        if imgs:
-                            bits.append(f"image(s)/logo(s) to check ({', '.join(imgs)})")
-                        if scanned:
-                            bits.append(f"scanned page(s) {', '.join(scanned)} — check by eye")
-                        if bits:
-                            flagged.append((out_name, bits, rep_))
-                    if flagged:
-                        st.warning(f"🔎 Before sending to a customer, review {len(flagged)} file(s):")
-                        for out_name, bits, rep_ in flagged:
-                            with st.expander(f"{out_name} — " + "; ".join(b.replace('**', '') for b in bits)):
-                                for pno, r in enumerate(rep_):
-                                    for n, spot in enumerate(r["spots"], 1):
-                                        st.markdown(f"p.{pno + 1} · #{n} · *{spot['reason']}*: `{spot['text']}`")
-                    else:
-                        st.info("🔎 No company/source info detected in the processed files.")
-
-                def _download(label, data, file_name, mime, key, stretch=False, **kw):
-                    # on_click="ignore" (Streamlit 1.43+) stops the page reloading on download
-                    base = dict(file_name=file_name, mime=mime, key=key, **kw)
-                    for extra in ({"on_click": "ignore"}, {}):
-                        try:
-                            if stretch:
-                                return _stretch_call(st.download_button, label, data, **base, **extra)
-                            return st.download_button(label, data, **base, **extra)
-                        except TypeError:
-                            continue
-
-                if res["zip"]:
-                    _download(f"⬇️ Download All ({len(files)} files) as ZIP", res["zip"],
-                              "SN_processed_pdfs.zip", "application/zip", "dl_wm_all_zip",
-                              stretch=True, type="primary")
-                    with st.expander("Download files individually"):
-                        for output_name, out_bytes in files:
-                            _download(f"⬇️ {output_name}", out_bytes, output_name,
-                                      "application/pdf", f"dl_{output_name}")
-                else:
-                    output_name, out_bytes = files[0]
-                    _download(f"⬇️ {output_name}", out_bytes, output_name,
-                              "application/pdf", f"dl_{output_name}", type="primary")
-
-    # ── Right panel, part 2: the live result ─────────────────────────────
-    if preview_ok:
-        with panel:
             after_img = wo_img
             if active_colors:
                 after_img = remove_colors(after_img, active_colors, *color_params)
             if add_header and header_exists:
-                after_img = paste_header(after_img, page_w_pt, PREVIEW_DPI,
-                                         img_width_pct / 100, top_margin)
+                after_img = paste_header(after_img, page_w_pt, PREVIEW_DPI, img_width_pct / 100, top_margin)
 
-            # Source-info check for this page (flags only)
             raster_for_ocr = None
             if pytesseract is not None:
                 raster_for_ocr = remove_colors(wo_img, active_colors, *color_params) if active_colors else wo_img
@@ -1591,15 +1571,20 @@ elif page == "🚿 Watermark Remover":
             if pv_report and si_highlight:
                 after_img = highlight_spots(after_img, pv_report["spots"])
 
-            modes = ["View only", "White out an area (drag)"]
-            if colors_on:
-                modes.append("Pick a stamp colour (click)")
-            if streamlit_image_coordinates is not None:
-                mode = st.radio("On the preview:", modes, horizontal=True, key="pv_mode")
-            else:
-                mode = "View only"
+            # interaction mode
+            modes = ["👁️ View", "⬜ White out (drag)", "🎨 Pick colour (click)"] if draw_ok else ["👁️ View"]
+            mode = modes[0]
+            if draw_ok:
+                if hasattr(st, "segmented_control"):
+                    mode = st.segmented_control("Mode", modes, default=modes[0], key="pv_mode",
+                                                label_visibility="collapsed") or modes[0]
+                else:
+                    mode = st.radio("Mode", modes, horizontal=True, key="pv_mode",
+                                    label_visibility="collapsed")
 
-            if mode == "View only":
+            st.markdown(chips(changes), unsafe_allow_html=True)
+
+            if mode == modes[0]:
                 _stretch_call(st.image, after_img)
             else:
                 import inspect
@@ -1610,7 +1595,9 @@ elif page == "🚿 Watermark Remover":
                     _kw = {"use_column_width": "always"}
                 else:
                     _kw = {"width": PICK_WIDTH}
-                drag = mode.startswith("White out")
+                drag = mode.startswith("⬜")
+                st.caption("Drag a box over the area to white out." if drag
+                           else "Click directly on the stamp's coloured ink.")
                 event = streamlit_image_coordinates(
                     after_img, key=f"pv_{'drag' if drag else 'pick'}_{preview_name}_{preview_page}",
                     click_and_drag=drag, cursor="crosshair", **_kw)
@@ -1619,7 +1606,6 @@ elif page == "🚿 Watermark Remover":
                     st.session_state["pv_last_event"] = event.get("unix_time")
                     shown_w = event.get("width") or after_img.width
                     shown_h = event.get("height") or after_img.height
-
                     if drag and "x1" in event:
                         fx = sorted([event["x1"] / shown_w, event["x2"] / shown_w])
                         fy = sorted([event["y1"] / shown_h, event["y2"] / shown_h])
@@ -1642,26 +1628,19 @@ elif page == "🚿 Watermark Remover":
                             hx = rgb_to_hex(picked)
                             if hx not in st.session_state["cr_colors"]:
                                 st.session_state["cr_colors"].append(hx)
+                                st.toast(f"Added stamp colour {hx}")
                                 st.rerun()
-
-            changes = []
-            if names_to_remove: changes.append(f"{len(names_to_remove)} overlay(s) removed")
-            if page_boxes: changes.append(f"{len(page_boxes)} area(s) whited out")
-            if active_colors: changes.append(f"{len(active_colors)} colour(s) removed")
-            if add_header and header_exists: changes.append("header added")
-            st.caption(f"{preview_name} — page {preview_page + 1} of {n_pages}. "
-                       "Showing: " + (", ".join(changes) if changes else "no changes yet"))
 
             if pv_report:
                 n_spots = len(pv_report["spots"])
                 notes = []
                 if n_spots:
-                    notes.append(f"**{n_spots} spot(s)** on this page may contain company/source info"
+                    notes.append(f"**{n_spots} spot(s)** may show company/source info"
                                  + (" (orange boxes)" if si_highlight else ""))
                 if pv_report["images"]:
-                    notes.append(f"{pv_report['images']} image(s) remain — check none is a supplier logo or stamp")
+                    notes.append(f"{pv_report['images']} image(s) remain — check none is a supplier logo")
                 if pv_report["scanned"] and not pv_report["ocr"]:
-                    notes.append("this page is a scan, so its text can't be checked automatically — review by eye")
+                    notes.append("scanned page — review text by eye")
                 if notes:
                     st.warning("🔎 " + " · ".join(notes))
                     if n_spots:
@@ -1670,6 +1649,112 @@ elif page == "🚿 Watermark Remover":
                                 st.markdown(f"#{n} · *{spot['reason']}*: `{spot['text']}`")
                 else:
                     st.success("🔎 No company/source info detected on this page.")
+        else:
+            st.markdown(chips(changes), unsafe_allow_html=True)
+
+        # ── export ───────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("📦 Process & Download")
+
+        if st.session_state.get("wm_results_sig") != upload_sig:
+            st.session_state["wm_results"] = None
+
+        if not changes:
+            st.caption("No edits selected yet — processing would return the files unchanged.")
+        if _stretch_call(st.button, f"⚙️ Process {len(file_bytes)} file(s)", type="primary", key="wm_process"):
+            results, errors, reports = [], [], {}
+            progress = st.progress(0, text="Processing…")
+            for i, (fname, data) in enumerate(file_bytes.items()):
+                try:
+                    output_name = f"SN-{fname.replace(' ', '_')}"
+                    out_bytes, text_stage, image_stage = process_pdf(
+                        data, names_to_remove, remove_gs,
+                        active_colors, color_params, raster_dpi,
+                        add_header and header_exists, img_width_pct / 100, top_margin,
+                        fname=fname, areas=st.session_state["wo_areas"] if preview_ok else [],
+                        return_stages=True,
+                    )
+                    with open(f"outputs/{output_name}", "wb") as f:
+                        f.write(out_bytes)
+                    results.append((output_name, out_bytes))
+                    if preview_ok:
+                        try:
+                            reports[output_name] = check_pdf(text_stage, ignore_terms, watch_terms,
+                                                             image_stage if active_colors else None)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    errors.append((fname, str(e)))
+                progress.progress((i + 1) / len(file_bytes), text=f"Processed {i + 1}/{len(file_bytes)}")
+            progress.empty()
+
+            zip_bytes = None
+            if len(results) > 1:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for output_name, out_bytes in results:
+                        zf.writestr(output_name, out_bytes)
+                zip_bytes = zip_buf.getvalue()
+            st.session_state["wm_results"] = {"files": results, "errors": errors, "ops": list(changes),
+                                              "zip": zip_bytes, "reports": reports}
+            st.session_state["wm_results_sig"] = upload_sig
+
+        res = st.session_state.get("wm_results")
+        if res:
+            for name, err in res["errors"]:
+                st.error(f"❌ {name}: {err}")
+            files = res["files"]
+            if files:
+                st.success(f"✅ {len(files)} file(s) ready" +
+                           (f" — {', '.join(res['ops'])}" if res["ops"] else "") + ".")
+
+                def _download(label, data, file_name, mime, key, stretch=False, **kw):
+                    # on_click="ignore" (Streamlit 1.43+) stops the page reloading on download
+                    base = dict(file_name=file_name, mime=mime, key=key, **kw)
+                    for extra in ({"on_click": "ignore"}, {}):
+                        try:
+                            if stretch:
+                                return _stretch_call(st.download_button, label, data, **base, **extra)
+                            return st.download_button(label, data, **base, **extra)
+                        except TypeError:
+                            continue
+
+                if res["zip"]:
+                    _download(f"⬇️ Download all ({len(files)} files) as ZIP", res["zip"],
+                              "SN_processed_pdfs.zip", "application/zip", "dl_wm_all_zip",
+                              stretch=True, type="primary")
+                    with st.expander("Download files individually"):
+                        for output_name, out_bytes in files:
+                            _download(f"⬇️ {output_name}", out_bytes, output_name,
+                                      "application/pdf", f"dl_{output_name}")
+                else:
+                    output_name, out_bytes = files[0]
+                    _download(f"⬇️ Download {output_name}", out_bytes, output_name,
+                              "application/pdf", f"dl_{output_name}", stretch=True, type="primary")
+
+                reports = res.get("reports") or {}
+                flagged = []
+                for out_name, rep_ in reports.items():
+                    total, parts, imgs, scanned = summarize_report(rep_)
+                    bits = []
+                    if total: bits.append(f"{total} spot(s) ({', '.join(parts)})")
+                    if imgs: bits.append(f"image(s) to check ({', '.join(imgs)})")
+                    if scanned: bits.append(f"scanned p.{', '.join(scanned)} — check by eye")
+                    if bits:
+                        flagged.append((out_name, bits, rep_))
+                if flagged:
+                    st.warning(f"🔎 Review before sending — {len(flagged)} file(s) may show source info:")
+                    for out_name, bits, rep_ in flagged:
+                        with st.expander(f"{out_name} — " + "; ".join(bits)):
+                            any_spot = False
+                            for pno, r in enumerate(rep_):
+                                for n, spot in enumerate(r["spots"], 1):
+                                    any_spot = True
+                                    st.markdown(f"p.{pno + 1} · #{n} · *{spot['reason']}*: `{spot['text']}`")
+                            if not any_spot:
+                                st.caption("No flagged text — only images or scanned pages to check.")
+                elif reports:
+                    st.info("🔎 No company/source info detected in the processed files.")
 
 
 # ==============================
