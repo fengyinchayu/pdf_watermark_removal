@@ -345,13 +345,18 @@ import io
 import numpy as np
 from PIL import Image as PILImage
 
+import sys
+FITZ_ERROR = ""
 try:
     import pymupdf as fitz  # PyMuPDF — page rendering for preview + colour removal
-except ImportError:
+except Exception as _e1:
     try:
         import fitz
-    except ImportError:
+        if not hasattr(fitz, "open"):   # the unrelated "fitz" package from PyPI
+            raise ImportError("a different package called 'fitz' is installed instead of PyMuPDF")
+    except Exception as _e2:
         fitz = None
+        FITZ_ERROR = f"{_e1} / {_e2}"
 
 try:  # optional: lets users click on the preview to pick a colour
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -361,6 +366,14 @@ except ImportError:
 HEADER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SN_Header.png")
 PREVIEW_DPI = 110
 PICK_WIDTH = 620   # display width (px) of the clickable preview
+
+
+def _stretch_call(fn, *args, **kw):
+    """Call a Streamlit element full-width on both new (width=) and old (use_container_width=) versions."""
+    try:
+        return fn(*args, width="stretch", **kw)
+    except TypeError:
+        return fn(*args, use_container_width=True, **kw)
 
 
 def _extract_image_thumbnail(xobj):
@@ -1007,7 +1020,7 @@ elif page == "🚿 Watermark Remover":
                     thumb    = item["thumbnail"]
 
                     if thumb:
-                        st.image(thumb, use_container_width=True)
+                        _stretch_call(st.image, thumb)
                     else:
                         if subtype == "Form":
                             icon, label = "📐", "Vector / Form"
@@ -1064,8 +1077,14 @@ elif page == "🚿 Watermark Remover":
         base_img, page_w_pt, page_h_pt = render_page(base_bytes, preview_page)
         orig_img, _, _ = render_page(file_bytes[preview_name], preview_page)
     else:
-        st.warning("Preview and colour removal need PyMuPDF. Install it with "
-                   "`py -m pip install pymupdf` and restart the app.")
+        st.warning(
+            "Preview and colour removal need PyMuPDF, which isn't available to the Python "
+            "running this app. Stop the app (Ctrl+C in the terminal), run the command below, "
+            "then start the app again."
+        )
+        st.code(f'"{sys.executable}" -m pip install pymupdf numpy', language="bash")
+        if FITZ_ERROR:
+            st.caption(f"Import error: {FITZ_ERROR}")
 
     # ── ④ Colour removal ──────────────────────────────────────────────────
     st.divider()
@@ -1214,10 +1233,10 @@ elif page == "🚿 Watermark Remover":
                             st.session_state["cr_colors"].append(hx)
                             st.rerun()
             else:
-                st.image(orig_img, use_container_width=True)
+                _stretch_call(st.image, orig_img)
         with pcol2:
             st.markdown("**After processing**")
-            st.image(after_img, use_container_width=True)
+            _stretch_call(st.image, after_img)
 
         changes = []
         if names_to_remove: changes.append(f"{len(names_to_remove)} overlay(s) removed")
@@ -1232,6 +1251,12 @@ elif page == "🚿 Watermark Remover":
     if colors_on and not active_colors:
         st.warning("Colour removal is on but no colours are selected — it will be skipped.")
 
+    # Results are kept in session_state so download buttons survive reruns
+    # (clicking any download button reruns the page).
+    upload_sig = tuple((n, len(b)) for n, b in file_bytes.items())
+    if st.session_state.get("wm_results_sig") != upload_sig:
+        st.session_state["wm_results"] = None      # new uploads -> clear old results
+
     if st.button("⚙️ Process Files", type="primary"):
         results, errors = [], []
         progress = st.progress(0, text="Processing...")
@@ -1240,16 +1265,15 @@ elif page == "🚿 Watermark Remover":
             try:
                 safe_name   = fname.replace(" ", "_")
                 output_name = f"SN-{safe_name}"
-                output_path = f"outputs/{output_name}"
 
                 out_bytes = process_pdf(
                     data, names_to_remove, remove_gs,
                     active_colors, color_params, raster_dpi,
                     add_header and header_exists, img_width_pct / 100, top_margin,
                 )
-                with open(output_path, "wb") as f:
+                with open(f"outputs/{output_name}", "wb") as f:
                     f.write(out_bytes)
-                results.append((output_name, output_path))
+                results.append((output_name, out_bytes))
 
             except Exception as e:
                 errors.append((fname, str(e)))
@@ -1259,38 +1283,57 @@ elif page == "🚿 Watermark Remover":
 
         progress.empty()
 
-        for name, err in errors:
+        ops = []
+        if names_to_remove: ops.append(f"{len(names_to_remove)} element(s) removed")
+        if active_colors:   ops.append(f"{len(active_colors)} colour(s) removed")
+        if add_header and header_exists: ops.append("header added")
+
+        zip_bytes = None
+        if len(results) > 1:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for output_name, out_bytes in results:
+                    zf.writestr(output_name, out_bytes)
+            zip_bytes = zip_buf.getvalue()
+
+        st.session_state["wm_results"] = {
+            "files": results, "errors": errors, "ops": ops, "zip": zip_bytes,
+        }
+        st.session_state["wm_results_sig"] = upload_sig
+
+    res = st.session_state.get("wm_results")
+    if res:
+        for name, err in res["errors"]:
             st.error(f"❌ {name}: {err}")
 
-        if results:
-            ops = []
-            if names_to_remove: ops.append(f"{len(names_to_remove)} element(s) removed")
-            if active_colors:   ops.append(f"{len(active_colors)} colour(s) removed")
-            if add_header and header_exists: ops.append("header added")
-            st.success(f"✅ {len(results)} file(s) done" +
-                       (f" ({', '.join(ops)})" if ops else "") + ".")
+        files = res["files"]
+        if files:
+            st.success(f"✅ {len(files)} file(s) done" +
+                       (f" ({', '.join(res['ops'])})" if res["ops"] else "") + ".")
 
-            if len(results) > 1:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for output_name, output_path in results:
-                        zf.write(output_path, arcname=output_name)
-                zip_buf.seek(0)
-                st.download_button(
-                    f"⬇️ Download All ({len(results)} files) as ZIP", zip_buf,
-                    file_name="SN_processed_pdfs.zip", mime="application/zip",
-                    key="dl_wm_all_zip", type="primary", use_container_width=True,
-                )
+            def _download(label, data, file_name, mime, key, stretch=False, **kw):
+                # on_click="ignore" (Streamlit 1.43+) stops the page reloading on download
+                base = dict(file_name=file_name, mime=mime, key=key, **kw)
+                for extra in ({"on_click": "ignore"}, {}):
+                    try:
+                        if stretch:
+                            return _stretch_call(st.download_button, label, data, **base, **extra)
+                        return st.download_button(label, data, **base, **extra)
+                    except TypeError:
+                        continue
 
-            for output_name, output_path in results:
-                with open(output_path, "rb") as f:
-                    st.download_button(
-                        label=f"⬇️ {output_name}",
-                        data=f,
-                        file_name=output_name,
-                        mime="application/pdf",
-                        key=f"dl_{output_name}"
-                    )
+            if res["zip"]:
+                _download(f"⬇️ Download All ({len(files)} files) as ZIP", res["zip"],
+                          "SN_processed_pdfs.zip", "application/zip", "dl_wm_all_zip",
+                          stretch=True, type="primary")
+                with st.expander("Download files individually"):
+                    for output_name, out_bytes in files:
+                        _download(f"⬇️ {output_name}", out_bytes, output_name,
+                                  "application/pdf", f"dl_{output_name}")
+            else:
+                output_name, out_bytes = files[0]
+                _download(f"⬇️ {output_name}", out_bytes, output_name,
+                          "application/pdf", f"dl_{output_name}", type="primary")
 
 
 # ==============================
@@ -1433,14 +1476,14 @@ elif page == "🔓 PDF Unlocker":
                     for output_name, output_path, _ in results:
                         zf.write(output_path, arcname=output_name)
                 zip_buf.seek(0)
-                st.download_button(
+                _stretch_call(
+                    st.download_button,
                     label=f"⬇️ Download All ({len(results)} files) as ZIP",
                     data=zip_buf,
                     file_name="unlocked_pdfs.zip",
                     mime="application/zip",
                     key="dl_unlock_all_zip",
                     type="primary",
-                    use_container_width=True,
                 )
                 st.caption("Or download files individually:")
 
