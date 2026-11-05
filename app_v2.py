@@ -365,7 +365,7 @@ except ImportError:
 
 HEADER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SN_Header.png")
 PREVIEW_DPI = 110
-PICK_WIDTH = 620   # display width (px) of the clickable preview
+PICK_WIDTH = 450   # fallback display width (px) of the clickable preview
 
 
 def _stretch_call(fn, *args, **kw):
@@ -813,7 +813,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigate to",
-        options=["📄 SPEC & COA Generator", "🚿 Watermark Remover", "🔓 PDF Unlocker"],
+        options=["🚿 Watermark Remover", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"],
         label_visibility="collapsed"
     )
     st.markdown("---")
@@ -1227,13 +1227,22 @@ elif page == "🚿 Watermark Remover":
         with pcol1:
             st.markdown("**Original**")
             if colors_on and streamlit_image_coordinates is not None:
-                disp_w = min(PICK_WIDTH, orig_img.width)
-                disp = orig_img.resize((disp_w, int(orig_img.height * disp_w / orig_img.width)))
-                click = streamlit_image_coordinates(
-                    disp, width=disp_w, key=f"cr_pick_{preview_name}_{preview_page}")
+                pick_key = f"cr_pick_{preview_name}_{preview_page}"
+                # scale the image to the column width so the whole page is visible
+                import inspect
+                _sig = str(inspect.signature(streamlit_image_coordinates))
+                if "stretch" in _sig:                 # newer versions
+                    _kw = {"width": "stretch"}
+                elif "use_column_width" in _sig:      # older versions
+                    _kw = {"use_column_width": "always"}
+                else:
+                    _kw = {"width": PICK_WIDTH}
+                click = streamlit_image_coordinates(orig_img, key=pick_key, **_kw)
                 if click and click != st.session_state["cr_last_click"]:
                     st.session_state["cr_last_click"] = click
-                    sx = orig_img.width / disp_w
+                    # the component reports the displayed size; map the click back to full size
+                    shown_w = click.get("width") or PICK_WIDTH
+                    sx = orig_img.width / shown_w
                     picked = pick_color_at(orig_img, int(click["x"] * sx), int(click["y"] * sx))
                     if picked is None:
                         st.toast("That spot isn't coloured ink — click directly on the stamp.")
