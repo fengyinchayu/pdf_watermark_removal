@@ -470,6 +470,16 @@ def scan_xobjects(pdf_bytes):
     return list(seen.values())
 
 
+def _set_page_contents(page, writer, content_obj):
+    """Replace a writer-owned page's content stream (works on old and new pypdf)."""
+    if hasattr(page, "replace_contents"):
+        page.replace_contents(content_obj)
+    else:  # very old pypdf
+        new_stream = DecodedStreamObject()
+        new_stream.set_data(content_obj.get_data())
+        page[NameObject("/Contents")] = writer._add_object(new_stream)
+
+
 @st.cache_data(show_spinner=False, max_entries=16)
 def remove_selected_bytes(input_pdf_bytes, names_to_remove, remove_gs=False):
     """Strip the chosen XObjects (and optionally gs operators). bytes -> bytes."""
@@ -477,35 +487,32 @@ def remove_selected_bytes(input_pdf_bytes, names_to_remove, remove_gs=False):
     if not names_to_remove and not remove_gs:
         return input_pdf_bytes
 
-    reader = PdfReader(io.BytesIO(input_pdf_bytes))
-    writer = PdfWriter()
+    # Pages are edited after they belong to the writer (required by pypdf 7+)
+    writer = PdfWriter(clone_from=io.BytesIO(input_pdf_bytes))
 
-    for page in reader.pages:
+    for page in writer.pages:
         content = page.get_contents()
         if content is None:
-            writer.add_page(page)
             continue
-
         try:
-            content_obj = ContentStream(content, reader)
+            content_obj = ContentStream(content, writer)
         except Exception:
-            writer.add_page(page)
             continue
 
         new_ops = []
+        changed = False
         for operands, operator in content_obj.operations:
-            if operator == b"Do" and operands:
-                if str(operands[0]) in names_to_remove:
-                    continue
+            if operator == b"Do" and operands and str(operands[0]) in names_to_remove:
+                changed = True
+                continue
             if operator == b"gs" and remove_gs:
+                changed = True
                 continue
             new_ops.append((operands, operator))
 
-        content_obj.operations = new_ops
-        new_stream = DecodedStreamObject()
-        new_stream.set_data(content_obj.get_data())
-        page[NameObject("/Contents")] = new_stream
-        writer.add_page(page)
+        if changed:
+            content_obj.operations = new_ops
+            _set_page_contents(page, writer, content_obj)
 
     buf = io.BytesIO()
     writer.write(buf)
@@ -539,17 +546,16 @@ def make_header_overlay(page_width, page_height, header_img_path,
 
 
 def add_header_bytes(pdf_bytes, img_width_frac=0.98, top_margin_pt=10):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
+    # Pages are edited after they belong to the writer (required by pypdf 7+)
+    writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
 
-    for page in reader.pages:
+    for page in writer.pages:
         pw = float(page.mediabox.width)
         ph = float(page.mediabox.height)
         overlay_bytes = make_header_overlay(pw, ph, HEADER_IMAGE_PATH,
                                             pw * img_width_frac, top_margin_pt)
         overlay_page  = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
         page.merge_page(overlay_page)
-        writer.add_page(page)
 
     buf = io.BytesIO()
     writer.write(buf)
