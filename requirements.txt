@@ -1,7 +1,7 @@
-streamlit
+streamlit>=1.40
 pdfplumber
 python-docx
-pypdf
+pypdf>=5,<8
 reportlab
 pillow
 numpy
