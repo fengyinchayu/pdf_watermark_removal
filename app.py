@@ -1055,8 +1055,9 @@ with st.sidebar:
     st.title("🧪 SN Tools")
     st.caption("Skyherb® internal document tools")
     st.markdown("---")
-    _tools = ["🚿 Watermark Remover", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"]
+    _tools = ["🚿 Watermark Remover", "🔬 COA Review", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"]
     _tool_help = ["Clean supplier PDFs: logos, stamps, white-out, header",
+                  "Check supplier COAs against our specs; draft supplier questions",
                   "Turn supplier SPEC/COA PDFs into Skyherb Word documents",
                   "Remove passwords and print/copy restrictions"]
     try:
@@ -1775,6 +1776,465 @@ elif page == "🚿 Watermark Remover":
                                 st.caption("No flagged text — only images or scanned pages to check.")
                 elif reports:
                     st.info("🔎 No company/source info detected in the processed files.")
+
+
+# ==============================
+# PAGE — COA Review
+# ==============================
+
+elif page == "🔬 COA Review":
+    import hashlib
+    import json
+    import pandas as pd
+    import coa_review as cr
+
+    def _secret(name):
+        try:
+            return st.secrets.get(name)
+        except Exception:
+            return None
+
+    API_KEY = _secret("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    MODEL = _secret("COA_MODEL") or os.environ.get("COA_MODEL") or cr.DEFAULT_MODEL
+    SPEC_LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spec_library.xlsx")
+    AUTO = "Auto-detect"
+    SEV_ICON = {"High": "🔴 High", "Medium": "🟠 Medium", "Low": "🔵 Low"}
+
+    for _k, _v in {"cr_results": {}, "cr_custom_rows": [], "cr_custom_name": "Customer spec"}.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+    if "cr_lib_bytes" not in st.session_state:
+        st.session_state["cr_lib_bytes"] = open(SPEC_LIB_PATH, "rb").read() if os.path.isfile(SPEC_LIB_PATH) else None
+        st.session_state["cr_lib_source"] = "spec_library.xlsx in the app" if st.session_state["cr_lib_bytes"] else ""
+
+    @st.cache_data(show_spinner=False, max_entries=8)
+    def _load_lib(data):
+        return cr.load_spec_library(data)
+
+    @st.cache_data(show_spinner=False, max_entries=64)
+    def _read_text(data):
+        return cr.extract_text_coa(data)
+
+    @st.cache_data(show_spinner=False, max_entries=64)
+    def _read_ai(data, filename, api_key, model):
+        return cr.ai_extract_coa(cr.make_client(api_key), model, data, filename)
+
+    @st.cache_data(show_spinner=False, max_entries=64)
+    def _judge_ai(coa_json, spec_key, prod_json, rules_json, api_key, model, _coa, _rows, _prod, _rules):
+        return cr.ai_review(cr.make_client(api_key), model, _coa, _rows, _prod, _rules)
+
+    def _lib_to_bytes(specs_df, products_df):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            specs_df.to_excel(xw, sheet_name="Specs", index=False)
+            products_df.to_excel(xw, sheet_name="Products", index=False)
+        return buf.getvalue()
+
+    specs_df = products_df = None
+    lib_error = ""
+    if st.session_state["cr_lib_bytes"]:
+        try:
+            specs_df, products_df = _load_lib(st.session_state["cr_lib_bytes"])
+        except Exception as e:
+            lib_error = str(e)
+    product_names = list(products_df["Product"]) if products_df is not None else []
+
+    # ── header ────────────────────────────────────────────────────────────
+    h1, h2 = st.columns([5, 1])
+    with h1:
+        st.title("🔬 COA Review")
+        st.markdown("<div class='sn-hint'>Upload supplier COAs → pick the spec → get a list of problems and a "
+                    "follow-up email for the supplier.</div>", unsafe_allow_html=True)
+    with h2:
+        st.write("")
+        if st.button("↺ Clear results", key="cr_clear"):
+            st.session_state["cr_results"] = {}
+            for k in [k for k in st.session_state.keys() if str(k).startswith(("cr_iss_", "cr_mail_", "cr_subj_"))]:
+                del st.session_state[k]
+            st.rerun()
+
+    _chips = ([f"🤖 AI on · {MODEL}"] if API_KEY else []) + \
+             ([f"📚 {len(product_names)} product spec(s)"] if product_names else [])
+    if _chips:
+        st.markdown(chips(_chips), unsafe_allow_html=True)
+    if not API_KEY:
+        st.caption("🤖 AI is off: text-based PDFs are checked by the rules; scanned COAs and judgement checks "
+                   "(methods, vague wording, product match) need an `ANTHROPIC_API_KEY` in the app's secrets.")
+    if lib_error:
+        st.error(f"Couldn't read the spec library: {lib_error}")
+
+    tab_review, tab_lib = st.tabs(["🔍 Review", "📚 Spec library"])
+
+    # ════════════════════════════ Spec library tab ═══════════════════════
+    with tab_lib:
+        st.markdown("<div class='sn-hint'>One row per product per test. Changes made here last for this "
+                    "session — download the file and replace <code>spec_library.xlsx</code> in GitHub to keep "
+                    "them.</div>", unsafe_allow_html=True)
+        st.caption(f"Using: {st.session_state.get('cr_lib_source') or 'no library loaded'}")
+        up = st.file_uploader("Use a different library (.xlsx)", type="xlsx", key="cr_lib_upload")
+        if up is not None and st.session_state.get("cr_lib_upload_sig") != (up.name, up.size):
+            try:
+                _load_lib(up.getvalue())
+                st.session_state["cr_lib_bytes"] = up.getvalue()
+                st.session_state["cr_lib_source"] = f"{up.name} (uploaded this session)"
+                st.session_state["cr_lib_upload_sig"] = (up.name, up.size)
+                st.rerun()
+            except Exception as e:
+                st.error(f"That file doesn't look like a spec library: {e}")
+
+        if specs_df is not None:
+            prod_filter = st.selectbox("Show product", ["All products"] + product_names, key="cr_lib_filter")
+            shown = specs_df if prod_filter == "All products" else specs_df[specs_df["Product"] == prod_filter]
+            st.markdown("**Specs**")
+            edited_specs = st.data_editor(
+                shown, num_rows="dynamic", key=f"cr_lib_specs_{prod_filter}", hide_index=True,
+                column_config={
+                    "Product": st.column_config.SelectboxColumn(options=product_names, required=True),
+                    "Category": st.column_config.SelectboxColumn(options=[
+                        "Assay", "Identification", "Physical", "Heavy metals", "Microbiology",
+                        "Residual solvents", "Pesticides", "Contaminants"]),
+                    "Min": st.column_config.NumberColumn(format="%g"),
+                    "Max": st.column_config.NumberColumn(format="%g"),
+                    "Required": st.column_config.SelectboxColumn(options=["Y", "N"]),
+                })
+            st.markdown("**Products**")
+            edited_products = st.data_editor(products_df, num_rows="dynamic", key="cr_lib_products",
+                                             hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("💾 Apply changes for this session", key="cr_lib_apply"):
+                    others = specs_df if prod_filter == "All products" else specs_df[specs_df["Product"] != prod_filter]
+                    merged = edited_specs if prod_filter == "All products" else pd.concat([others, edited_specs])
+                    st.session_state["cr_lib_bytes"] = _lib_to_bytes(merged.dropna(subset=["Product", "Test"]),
+                                                                     edited_products.dropna(subset=["Product"]))
+                    st.session_state["cr_lib_source"] = "edited in this session — download to keep"
+                    st.rerun()
+            with c2:
+                _stretch_call(st.download_button, "⬇️ Download spec_library.xlsx", st.session_state["cr_lib_bytes"],
+                              file_name="spec_library.xlsx",
+                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                              key="cr_lib_dl")
+        else:
+            st.info("No spec library yet. Add `spec_library.xlsx` next to `app.py` in GitHub, or upload one above.")
+
+    # ════════════════════════════ Review tab ═════════════════════════════
+    with tab_review:
+        left, right = st.columns([1.1, 1], gap="large")
+
+        with left:
+            st.subheader("① Supplier COAs")
+            coa_files = st.file_uploader("PDF or scanned images — several at once is fine",
+                                         type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True,
+                                         key="cr_upload")
+
+        with right:
+            st.subheader("② Specification")
+            spec_mode = st.radio("Compare against", ["Spec library", "Customer spec file"], horizontal=True,
+                                 key="cr_spec_mode", label_visibility="collapsed")
+            if spec_mode == "Customer spec file":
+                spec_file = st.file_uploader("Customer specification (PDF, image or .xlsx)",
+                                             type=["pdf", "png", "jpg", "jpeg", "xlsx"], key="cr_spec_upload")
+                if spec_file is not None and st.session_state.get("cr_spec_sig") != (spec_file.name, spec_file.size):
+                    with st.spinner("Reading the specification…"):
+                        rows, pname, err = [], "", ""
+                        try:
+                            if spec_file.name.lower().endswith(".xlsx"):
+                                sdf, _ = cr.load_spec_library(spec_file.getvalue())
+                                rows = sdf.drop(columns=["Product"]).to_dict("records")
+                                pname = str(sdf["Product"].iloc[0]) if len(sdf) else ""
+                            elif API_KEY:
+                                pname, rows = cr.ai_extract_spec(cr.make_client(API_KEY), MODEL,
+                                                                 spec_file.getvalue(), spec_file.name)
+                            elif spec_file.name.lower().endswith(".pdf"):
+                                rows = cr.text_spec_rows(spec_file.getvalue())
+                            else:
+                                err = "Reading an image needs the AI (add an API key), or upload a PDF/.xlsx."
+                        except Exception as e:
+                            err = str(e)
+                    st.session_state["cr_custom_rows"] = rows
+                    st.session_state["cr_custom_name"] = pname or os.path.splitext(spec_file.name)[0]
+                    st.session_state["cr_spec_sig"] = (spec_file.name, spec_file.size)
+                    st.session_state.pop("cr_custom_editor", None)
+                    if err:
+                        st.error(err)
+                    elif not rows:
+                        st.warning("No test rows found — add them in the table below.")
+                st.text_input("Product name", key="cr_custom_name")
+                base_rows = st.session_state["cr_custom_rows"] or [
+                    {c: None for c in cr.SPEC_COLUMNS if c != "Product"}]
+                custom_df = st.data_editor(
+                    pd.DataFrame(base_rows, columns=[c for c in cr.SPEC_COLUMNS if c != "Product"]),
+                    num_rows="dynamic", hide_index=True, key="cr_custom_editor",
+                    column_config={"Min": st.column_config.NumberColumn(format="%g"),
+                                   "Max": st.column_config.NumberColumn(format="%g"),
+                                   "Required": st.column_config.SelectboxColumn(options=["Y", "N"])})
+                st.caption("Check the limits read from the file before reviewing.")
+                if specs_df is not None and st.button("➕ Add this spec to the library (this session)",
+                                                      key="cr_custom_save"):
+                    name = st.session_state["cr_custom_name"].strip() or "Customer spec"
+                    add = custom_df.dropna(subset=["Test"]).assign(Product=name)[cr.SPEC_COLUMNS]
+                    new_specs = pd.concat([specs_df[specs_df["Product"] != name], add], ignore_index=True)
+                    new_prods = products_df if name in product_names else pd.concat(
+                        [products_df, pd.DataFrame([{"Product": name}])], ignore_index=True)
+                    st.session_state["cr_lib_bytes"] = _lib_to_bytes(new_specs, new_prods)
+                    st.session_state["cr_lib_source"] = "edited in this session — download to keep"
+                    st.rerun()
+            elif not product_names:
+                st.warning("No spec library loaded — see the 📚 Spec library tab, or use a customer spec file.")
+            else:
+                st.caption("Each COA is matched to a product automatically by its name. Override it in the "
+                           "table below if needed.")
+
+        if not coa_files:
+            st.info("⬆️ Upload one or more COAs to start.")
+            st.stop()
+
+        file_bytes = {f.name: f.getvalue() for f in coa_files}
+
+        # per-file spec choice
+        if spec_mode == "Spec library" and product_names:
+            plan = pd.DataFrame({"COA file": list(file_bytes),
+                                 "Spec": [st.session_state.get("cr_choice", {}).get(n, AUTO) for n in file_bytes]})
+            plan = st.data_editor(plan, hide_index=True, key="cr_plan", disabled=["COA file"],
+                                  column_config={"Spec": st.column_config.SelectboxColumn(
+                                      options=[AUTO] + product_names, required=True)})
+            st.session_state["cr_choice"] = dict(zip(plan["COA file"], plan["Spec"]))
+
+        o1, o2, o3 = st.columns([1, 1.4, 1.2])
+        with o1:
+            use_ai = st.toggle("Use AI", value=bool(API_KEY), disabled=not API_KEY, key="cr_use_ai",
+                               help="Reads scans and adds judgement checks. COAs are sent to the Claude API.")
+        with o2:
+            supplier_name = st.text_input("Supplier name for the email (optional)", key="cr_supplier")
+        with o3:
+            st.write("")
+            go = _stretch_call(st.button, f"🔍 Review {len(file_bytes)} COA(s)", type="primary", key="cr_go")
+
+        # ── run ───────────────────────────────────────────────────────────
+        if go:
+            results = {}
+            prog = st.progress(0, text="Reviewing…")
+            for i, (fname, data) in enumerate(file_bytes.items()):
+                prog.progress(i / len(file_bytes), text=f"Reading {fname}…")
+                rec = {"file": fname, "error": "", "warnings": [], "source": ""}
+                is_pdf = fname.lower().endswith(".pdf")
+                coa = None
+                if is_pdf:
+                    try:
+                        coa = _read_text(data)
+                    except Exception as e:
+                        rec["warnings"].append(f"Text reading failed: {e}")
+                if use_ai and API_KEY:
+                    try:
+                        coa = _read_ai(data, fname, API_KEY, MODEL)
+                    except Exception as e:
+                        rec["warnings"].append(f"AI reading failed ({e}); used the text reader instead.")
+                if coa is None or (not coa["tests"] and coa.get("scanned", not is_pdf)):
+                    rec["error"] = ("This looks like a scanned COA (no text to read). Turn on AI to read it."
+                                    if not (use_ai and API_KEY) else "No test results could be read from this file.")
+                    rec["short"] = "Scanned — needs AI" if not (use_ai and API_KEY) else "Couldn't read results"
+                    rec.update(info=(coa or {}).get("info", {}), coa=coa or {"info": {}, "tests": []},
+                               product="", result={"tests": [], "findings": [], "counts": {}}, findings=[])
+                    results[fname] = rec
+                    continue
+                rec["source"] = "AI" if coa["source"] == "ai" else "Text"
+
+                # which spec
+                if spec_mode == "Customer spec file":
+                    pname = st.session_state["cr_custom_name"].strip() or "Customer spec"
+                    cdf = custom_df.dropna(subset=["Test"]).assign(Product=pname)
+                    spec_rows = cr.spec_rows_for(cr._norm_cols(cdf, cr.SPEC_COLUMNS), pname)
+                    pinfo = {}
+                else:
+                    choice = st.session_state.get("cr_choice", {}).get(fname, AUTO)
+                    pname = choice
+                    if choice == AUTO:
+                        pname, score = cr.match_product(coa["info"].get("product_name", ""), products_df) \
+                            if products_df is not None else (None, 0)
+                    spec_rows = cr.spec_rows_for(specs_df, pname) if pname else []
+                    pinfo = cr.product_info(products_df, pname) if pname else {}
+                if not spec_rows:
+                    rec["error"] = (f"No matching spec for '{coa['info'].get('product_name', '?')}'. Pick the "
+                                    "product in the table above and review again.")
+                    rec["short"] = "No matching spec — pick one"
+                prog.progress((i + 0.5) / len(file_bytes), text=f"Checking {fname}…")
+                result = cr.review_coa(coa, spec_rows, pinfo, pname or "")
+                findings = result["findings"]
+                if use_ai and API_KEY and spec_rows:
+                    try:
+                        ai = _judge_ai(json.dumps(coa, sort_keys=True, default=str), pname,
+                                       json.dumps(pinfo, sort_keys=True),
+                                       json.dumps(findings, sort_keys=True), API_KEY, MODEL,
+                                       coa, spec_rows, pinfo, findings)
+                        findings = cr.merge_ai(findings, ai, coa.get("warnings", []))
+                    except Exception as e:
+                        rec["warnings"].append(f"AI checks failed: {e}")
+                rec.update(info=coa["info"], coa=coa, product=pname or "", result=result, findings=findings)
+                results[fname] = rec
+            prog.empty()
+            st.session_state["cr_results"] = results
+            for k in [k for k in st.session_state.keys() if str(k).startswith(("cr_iss_", "cr_mail_", "cr_subj_"))]:
+                del st.session_state[k]
+
+        results = {k: v for k, v in st.session_state["cr_results"].items() if k in file_bytes}
+        if not results:
+            st.stop()
+
+        # ── ③ results ─────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("③ Results")
+
+        def _included(rec):
+            df = st.session_state.get(f"cr_iss_{rec['file']}")
+            if isinstance(df, pd.DataFrame):
+                df = df[df["Include"].fillna(False).astype(bool)].drop(columns=["Include"])
+                rows = df.astype(object).where(df.notna(), "").to_dict("records")
+                for r in rows:
+                    r["Severity"] = str(r.get("Severity") or "Low").split()[-1]
+                    r["Status"] = r.get("Status") or "Review"
+                return [r for r in rows if str(r.get("Item", "")).strip() or str(r.get("Detail", "")).strip()]
+            return rec["findings"]
+
+        summary_slot = st.container()
+        sel = st.selectbox("Details for", list(results), key="cr_sel") if len(results) > 1 else next(iter(results))
+
+        def _fill_summary():
+            summary = []
+            for rec in results.values():
+                inc = _included(rec)
+                summary.append({
+                    "COA file": rec["file"], "Spec": rec["product"] or "—", "Lot": rec["info"].get("lot_no", ""),
+                    "Verdict": ("⚠️ " + rec.get("short", rec["error"])) if rec["error"] else
+                    ("❌ " if any(f["Severity"] == "High" for f in inc) else
+                     "⚠️ " if any(f["Severity"] == "Medium" for f in inc) else "✅ ") + cr.verdict(inc),
+                    "High": sum(f["Severity"] == "High" for f in inc),
+                    "Medium": sum(f["Severity"] == "Medium" for f in inc),
+                    "Low": sum(f["Severity"] == "Low" for f in inc), "Read by": rec["source"],
+                })
+            with summary_slot:
+                _stretch_call(st.dataframe, pd.DataFrame(summary), hide_index=True)
+                reviewed = [dict(r, findings=_included(r)) for r in results.values()
+                            if r["result"]["tests"] and not r["error"]]
+                if len(reviewed) > 1:
+                    _stretch_call(st.download_button, f"⬇️ Download all {len(reviewed)} reviews (Excel)",
+                                  cr.to_excel(reviewed), file_name=f"COA_review_{datetime.today():%Y-%m-%d}.xlsx",
+                                  mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                  key="cr_dl_all")
+
+        rec = results[sel]
+        for w in rec["warnings"]:
+            st.warning(w)
+        if rec["error"]:
+            st.error(rec["error"])
+        if not rec["result"]["tests"] and not rec["findings"]:
+            _fill_summary()
+            st.stop()
+
+        info = rec["info"]
+        d1, d2 = st.columns([1.15, 1], gap="large")
+        with d1:
+            st.markdown(f"**{info.get('product_name') or sel}**  \n"
+                        f"Spec: {rec['product'] or '—'} · Lot {info.get('lot_no') or '—'} · "
+                        f"Mfg {info.get('mfg_date') or '—'} · Exp {info.get('expiry_date') or info.get('retest_date') or '—'}")
+        with d2:
+            cnt = rec["result"].get("counts", {})
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("❌ Fail", cnt.get("Fail", 0))
+            m2.metric("⚠️ Missing", cnt.get("Missing", 0))
+            m3.metric("🔍 Review", cnt.get("Review", 0))
+            m4.metric("✅ Pass", cnt.get("Pass", 0))
+
+        t_iss, t_tests, t_mail, t_info = st.tabs(["🚩 Issues", "📋 Test by test", "✉️ Supplier email", "ℹ️ COA details"])
+
+        with t_iss:
+            st.markdown("<div class='sn-hint'>Untick anything that isn't a real problem, edit the wording, "
+                        "or add a row for something the tool missed (it's kept in the export as “Manual”).</div>",
+                        unsafe_allow_html=True)
+            key = f"cr_iss_{sel}"
+            base = pd.DataFrame(rec["findings"], columns=["Severity", "Status", "Item", "Detail",
+                                                          "Question for supplier", "Category", "Source"])
+            base.insert(0, "Include", True)
+            base["Severity"] = base["Severity"].map(lambda s: SEV_ICON.get(s, s))
+            edited = st.data_editor(
+                base, num_rows="dynamic", hide_index=True, key=key + "_ed",
+                column_order=["Include", "Severity", "Status", "Item", "Detail", "Question for supplier", "Source"],
+                column_config={
+                    "Include": st.column_config.CheckboxColumn(default=True, width="small"),
+                    "Severity": st.column_config.SelectboxColumn(options=list(SEV_ICON.values()),
+                                                                 default="🟠 Medium", width="small"),
+                    "Status": st.column_config.SelectboxColumn(options=["Fail", "Missing", "Review"],
+                                                               default="Review", width="small"),
+                    "Detail": st.column_config.TextColumn(width="large"),
+                    "Question for supplier": st.column_config.TextColumn(width="large"),
+                    "Source": st.column_config.TextColumn(default="Manual", width="small"),
+                })
+            edited["Source"] = edited["Source"].fillna("Manual")
+            edited["Category"] = edited["Category"].fillna("Manual")
+            st.session_state[key] = edited
+            if edited.empty:
+                st.success("No issues found against this specification.")
+
+        inc = _included(rec)
+        with t_tests:
+            only = st.toggle("Only show problems", value=False, key=f"cr_only_{sel}")
+            tdf = pd.DataFrame(rec["result"]["tests"])
+            if not tdf.empty:
+                if only:
+                    tdf = tdf[tdf["Status"].isin(["Fail", "Missing", "Review"])]
+                tdf["Status"] = tdf["Status"].map(lambda s: cr.STATUS_ICON.get(s, s))
+                _stretch_call(st.dataframe, tdf[["Status", "Test (spec)", "Our limit", "COA result", "Test (COA)",
+                                                 "COA spec", "Method", "Note"]], hide_index=True)
+
+        with t_mail:
+            subj, body = cr.build_email(info, inc, rec["product"], st.session_state.get("cr_supplier", "")
+                                        or info.get("supplier", ""))
+            sig = hashlib.md5(json.dumps([f.get("Question for supplier") for f in inc]).encode()).hexdigest()
+            if st.session_state.get(f"cr_mailsig_{sel}") != sig:      # issues changed -> rebuild the draft
+                st.session_state[f"cr_subj_{sel}"] = subj
+                st.session_state[f"cr_mail_{sel}"] = body
+                st.session_state[f"cr_mailsig_{sel}"] = sig
+            st.text_input("Subject", key=f"cr_subj_{sel}")
+            st.text_area("Email", key=f"cr_mail_{sel}", height=320)
+            def _polish(f=sel):
+                try:
+                    st.session_state[f"cr_mail_{f}"] = cr.ai_polish_email(
+                        cr.make_client(API_KEY), MODEL, st.session_state[f"cr_subj_{f}"],
+                        st.session_state[f"cr_mail_{f}"])
+                except Exception as e:
+                    st.session_state["cr_polish_error"] = str(e)
+
+            e1, e2 = st.columns(2)
+            with e1:
+                if API_KEY:
+                    st.button("✨ Polish wording with AI", key=f"cr_polish_{sel}", on_click=_polish)
+                if st.session_state.get("cr_polish_error"):
+                    st.error(f"AI polishing failed: {st.session_state.pop('cr_polish_error')}")
+            with e2:
+                st.download_button("⬇️ Download email (.txt)",
+                                   f"Subject: {st.session_state[f'cr_subj_{sel}']}\n\n{st.session_state[f'cr_mail_{sel}']}",
+                                   file_name=f"COA_email_{os.path.splitext(sel)[0]}.txt", key=f"cr_dl_mail_{sel}")
+            st.caption("The draft follows the ticked issues in 🚩 Issues. Edits here are kept until the issues change.")
+
+        with t_info:
+            _stretch_call(st.dataframe, pd.DataFrame([{"Field": k.replace("_", " ").capitalize(), "Value": v}
+                                                      for k, v in info.items()]), hide_index=True)
+            signed = rec["coa"].get("signed")
+            st.caption(f"Read by: {rec['source']} · Signature: "
+                       f"{'yes' if signed else 'not found' if signed is False else 'not checked (check by eye)'}")
+
+        one = dict(rec, findings=inc)
+        stem = os.path.splitext(sel)[0]
+        x1, x2 = st.columns(2)
+        with x1:
+            _stretch_call(st.download_button, "⬇️ Report (PDF)", cr.to_pdf(one, f"COA Review — {rec['product'] or stem}"),
+                          file_name=f"COA_review_{stem}.pdf", mime="application/pdf", key=f"cr_dl_pdf_{sel}")
+        with x2:
+            _stretch_call(st.download_button, "⬇️ Report (Excel)", cr.to_excel([one]),
+                          file_name=f"COA_review_{stem}.xlsx",
+                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                          key=f"cr_dl_xlsx_{sel}")
+
+        _fill_summary()
 
 
 # ==============================
