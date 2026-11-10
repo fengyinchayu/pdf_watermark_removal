@@ -537,6 +537,8 @@ def _scan_info_line(line, found):
     for i, (s, e, key) in enumerate(kept):
         nxt = kept[i + 1][0] if i + 1 < len(kept) else len(line)
         val = line[e:nxt].strip(" :#.,;|\t")
+        if key == "lot_no" and not re.search(r"\d", val):
+            continue                       # "lot to lot" in a sentence is not a lot number
         if val and key != "_stop" and key not in found and len(val) < 120:
             found[key] = val
 
