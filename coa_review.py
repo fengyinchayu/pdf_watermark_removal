@@ -299,7 +299,7 @@ def parse_result(text, default_unit=""):
 # canonical name -> patterns (searched on the cleaned, lower-case name)
 ALIASES = [
     ("yeast & mold", r"yeasts?\s*(?:&|and|/|\+)\s*mou?lds?|mou?lds?\s*(?:&|and|/|\+)\s*yeasts?|tymc|\by\s*&\s*m\b|combined\s+yeast"),
-    ("total plate count", r"total\s+(?:plate|aerobic|bacteri\w*|viable)\s*(?:microbial\s+)?count|aerobic\s+plate|\btpc\b|\bapc\b|\btamc\b|plate\s+count|total\s+aerobic"),
+    ("total plate count", r"total\s+(?:plate|aerobic|bacteri\w*|viable)\s*(?:microbial\s+)?count|aerobic\s+plate|aerobic\s+(?:bacteri\w*|microbial|mesophilic)\s+count|\btpc\b|\bapc\b|\btamc\b|plate\s+count|total\s+aerobic"),
     ("e. coli", r"e\.?\s?coli|escherichia"),
     ("salmonella", r"salmonella"),
     ("staphylococcus aureus", r"staph\w*|s\.\s?aureus"),
@@ -350,10 +350,17 @@ _HEADING_WORDS = re.compile(r"^(identification|purity|assay|physical|chemical|he
                             r"organoleptic\w*|general|others?|test\s+items?)$", re.I)
 
 
+_ALIAS_SQ = [(c, re.compile(p.replace(r"\s+", r"\s*"), re.I)) for c, p in ALIASES]
+
+
 def canon(name):
     n = clean_name(name)
     for c, rx in _ALIAS_RE:
         if rx.search(n):
+            return c
+    sq = n.replace(" ", "")
+    for c, rx in _ALIAS_SQ:                 # names stored without spaces, e.g. "LossonDrying"
+        if len(sq) > 3 and rx.search(sq):
             return c
     return n
 
@@ -488,21 +495,22 @@ INFO_FIELDS = [
                  r"production\s+date|produced\s+date|date\s+of\s+production|prod\.?\s*date|manu\.?\s*date", False),
     ("expiry_date", r"expir\w*\s+date|exp\.?\s*date|expiry|expiration|best\s+before|use\s+by|valid\s+until", False),
     ("retest_date", r"re-?test\s+date", False),
-    ("test_date", r"test(?:ing)?\s+date|date\s+of\s+(?:analysis|test(?:ing)?)|analy[sz](?:is|ed)\s+date|"
-                  r"inspection\s+date|analy[sz]ed\s+on", False),
+    ("test_date", r"test(?:ing)?\s+date|date\s+of\s+(?:analysis|test(?:ing)?|examination)|analy[sz](?:is|ed)\s+date|"
+                  r"inspection\s+date|examination\s+date|check(?:ing)?\s+date|analy[sz]ed\s+on", False),
     ("report_date", r"report\s+date|issue\s+date|date\s+of\s+issue|issued\s+(?:by\s+[\w &.]{1,40}?\s+)?on|"
                     r"release\s+date|approv(?:al|ed)\s+date|date\s+of\s+report|date\s+of\s+release", False),
-    ("lot_no", r"lot\s*(?:no|number|#|num)?\.?|batch\s*(?:no|number|#|num)?\.?", False),
+    ("lot_no", r"lot\s*(?:no|number|#|num)?\.?|batch\s*(?:no|number|#|num)?\.?(?!\s*(?:quantity|size))", False),
     ("product_name", r"trade\s+name|product\s+name|name\s+of\s+(?:the\s+)?product|item\s+name|commodity|"
                      r"material\s+name|sample\s+name|product", True),
     ("shelf_life", r"shelf\s*-?\s*life", False),
-    ("quantity", r"quantity|batch\s+size|qty", True),
+    ("quantity", r"batch\s+quantity|lot\s+quantity|quantity|batch\s+size|lot\s+size|qty", True),
     ("latin_name", r"latin\s+name|botanical\s+(?:name|source)|scientific\s+name|plant\s+source|source\s+plant", False),
-    ("plant_part", r"parts?\s+used|plant\s+parts?|used\s+parts?", False),
+    ("plant_part", r"parts?\s+used|plant\s+parts?|used\s+parts?|parts?\s+of\s+(?:the\s+)?plant", False),
     ("solvent", r"extraction\s+solvents?|solvents?\s+(?:used|of\s+extraction|for\s+extraction)|extract(?:ion)?\s+solvents?|(?<!residual\s)solvents?", True),
     ("carrier", r"carriers?|excipients?", True),
     ("ratio", r"extract(?:ion)?\s+ratio|ratio", True),
     ("supplier", r"manufacturer|supplier|producer|manufactured\s+by|produced\s+by", True),
+    ("_stop", r"package\s+size|packing|packaging|net\s+weight|storage|specification|conclusion|remarks?", True),
 ]
 _INFO_RE = [(k, re.compile(rf"(?<![\w])(?:{p})(?![\w])\s*(?P<sep>[:#.]|\s)", re.I), strict) for k, p, strict in INFO_FIELDS]
 _APPROVAL = re.compile(r"approved\s+by|signature|signed|authori[sz]ed|q[ac]\s+manager|quality\s+(?:assurance|control)"
@@ -515,6 +523,7 @@ def _scan_info_line(line, found):
     for key, rx, strict in _INFO_RE:
         for m in rx.finditer(line):
             if strict and m.group("sep") not in (":", "#"):
+                hits.append((m.start(), m.end(), "_stop"))     # not a value, but ends the one before
                 continue
             hits.append((m.start(), m.end(), key))
     if not hits:
@@ -528,7 +537,7 @@ def _scan_info_line(line, found):
     for i, (s, e, key) in enumerate(kept):
         nxt = kept[i + 1][0] if i + 1 < len(kept) else len(line)
         val = line[e:nxt].strip(" :#.,;|\t")
-        if val and key not in found and len(val) < 120:
+        if val and key != "_stop" and key not in found and len(val) < 120:
             found[key] = val
 
 
@@ -600,7 +609,7 @@ def _line_cells(words, gap=7.0):
 
 def _rows_from_words(page):
     """Rebuild table rows from word positions (for COAs whose tables have no ruling lines)."""
-    words = page.extract_words(keep_blank_chars=False, use_text_flow=False) or []
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False, x_tolerance=1.5) or []
     lines = {}
     for w in words:
         key = round(w["top"] / 3)
@@ -632,10 +641,10 @@ def extract_text_coa(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         n_pages = len(pdf.pages)
         for page in pdf.pages:
-            text = page.extract_text() or ""
+            text = page.extract_text(x_tolerance=1.5) or ""      # 1.5 keeps spaces some PDFs lose at 3
             n_chars += len(text.strip())
             lines += [norm_text(l) for l in text.splitlines() if l.strip()]
-            page_tables = page.extract_tables() or []
+            page_tables = page.extract_tables({"text_x_tolerance": 1.5}) or []
             if not _tests_from_tables(page_tables):
                 try:
                     rebuilt = _rows_from_words(page)       # tables without ruling lines
@@ -644,13 +653,15 @@ def extract_text_coa(pdf_bytes):
                 except Exception:
                     pass
             tables += page_tables
+    kv_lines = []
     for table in tables:                                  # key/value cells, e.g. | Lot No. | 2401 |
         for row in table:
             cells = [norm_text(c) for c in row if c]
             for i in range(0, len(cells) - 1, 2):
-                lines.append(f"{cells[i]}: {cells[i + 1]}")
-    for line in lines:
+                kv_lines.append(f"{cells[i]}: {cells[i + 1]}")
+    for line in kv_lines + lines:                         # table cells first, then free text
         _scan_info_line(line, info)
+    lines += kv_lines
     tests = _tests_from_tables(tables)
     raw = "\n".join(lines)
     return {
