@@ -5,5 +5,8 @@ pypdf>=5,<8
 reportlab
 pillow
 numpy
+pandas
+openpyxl
 pymupdf
 streamlit-image-coordinates
+anthropic
