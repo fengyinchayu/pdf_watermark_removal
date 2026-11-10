@@ -1123,6 +1123,7 @@ if page == "📄 SPEC & COA Generator":
     st.session_state.setdefault("gen_rows", [])
     st.session_state.setdefault("gen_rows_v", 0)
     st.session_state.setdefault("gen_msgs", [])
+    st.session_state.setdefault("gen_doctype", "COA")
     for k, _ in FIELDS:
         st.session_state.setdefault(f"gen_f_{k}", "China" if k == "Origin" else "")
 
@@ -1150,6 +1151,7 @@ if page == "📄 SPEC & COA Generator":
         st.session_state["gen_msgs"] = []
         st.session_state.pop("gen_out", None)
         st.session_state["gen_product"] = NONE
+        st.session_state["gen_doctype"] = "COA"
 
     def _gen_read():
         """Read the uploaded supplier document into the form (runs before the widgets are drawn)."""
@@ -1213,6 +1215,10 @@ if page == "📄 SPEC & COA Generator":
         st.session_state["gen_rows"] = rows
         st.session_state["gen_rows_v"] += 1
         st.session_state.pop("gen_out", None)
+        has_results = any(str(r.get("Results", "")).strip() for r in rows)
+        st.session_state["gen_doctype"] = "COA" if has_results else "SPEC"
+        if not has_results:
+            msgs.append(("info", "No results on this document, so it's treated as a specification → creating a SPEC."))
         src = "AI" if coa["source"] == "ai" else "text reader"
         msgs.insert(0, ("success", f"Read {len(rows)} test rows with the {src}"
                         + (f"; matched to “{prod}” in the spec library." if prod else ".")))
@@ -1249,6 +1255,7 @@ if page == "📄 SPEC & COA Generator":
         .sn-doc th {background: #c0c0c0; font-size: 12px;}
         .sn-doc td.lbl {font-weight: bold; width: 18%;}
         .sn-doc tr.grp td {background: #eef4f1; font-style: italic; font-weight: bold;}
+        .sn-doc tr.ban td {font-weight: bold; font-size: 13px; padding-left: 14px;}
         .sn-doc tr.bad td {background: #fde2e1;}
         .sn-doc td.c {text-align: center;}
         </style>""", unsafe_allow_html=True)
@@ -1286,7 +1293,14 @@ if page == "📄 SPEC & COA Generator":
         for level, msg in st.session_state["gen_msgs"]:
             getattr(st, level)(msg)
 
-        st.subheader("② Product & batch")
+        st.subheader("② Product details")
+        if hasattr(st, "segmented_control"):
+            doc_type = st.segmented_control("Create", ["COA", "SPEC", "COA + SPEC"],
+                                            key="gen_doctype") or "COA"
+        else:
+            doc_type = st.radio("Create", ["COA", "SPEC", "COA + SPEC"], horizontal=True, key="gen_doctype")
+        kinds = ["COA", "SPEC"] if doc_type == "COA + SPEC" else [doc_type]
+        BATCH = {"LotNo", "Quantity", "ManuDate", "ExpiryDate"}
         pc1, pc2 = st.columns([2, 1])
         with pc1:
             st.selectbox("Our product (spec library)", [NONE] + lib_products, key="gen_product",
@@ -1294,9 +1308,12 @@ if page == "📄 SPEC & COA Generator":
         with pc2:
             date_fmt = st.selectbox("Date format", list(cg.DATE_FORMATS), key="gen_datefmt")
         fc1, fc2 = st.columns(2)
-        for i, (k, label) in enumerate(FIELDS):
+        shown_fields = [(k, l) for k, l in FIELDS if "COA" in kinds or k not in BATCH]
+        for i, (k, label) in enumerate(shown_fields):
             with (fc1 if i % 2 == 0 else fc2):
                 st.text_input(label, key=f"gen_f_{k}")
+        if "COA" not in kinds:
+            st.caption("A SPEC has no lot, quantity or dates — those fields are hidden.")
 
         st.subheader("③ Tests")
         o1, o2 = st.columns([1.3, 1])
@@ -1306,8 +1323,9 @@ if page == "📄 SPEC & COA Generator":
                       help="Replaces the supplier's limits with the spec library's, and adds required tests "
                            "the supplier didn't report (fill in their results).")
         with o2:
-            group_headings = st.toggle("Group headings", value=True, key="gen_groups",
-                                       help="Sub-headings such as 'Heavy Metals' inside the table.")
+            group_headings = st.toggle("Extra sub-headings", value=False, key="gen_groups",
+                                       help="Skyherb style puts headings only on Solvents Residue and "
+                                            "Microbiological. Turn on to also head Physical, Assay and Heavy Metals.")
         cols = ["Include", "Group", "Characteristic", "Standards", "Results", "Methods", "Supplier info?"]
         base = pd.DataFrame(st.session_state["gen_rows"] or [], columns=cols)
         base["Include"] = base["Include"].fillna(True).astype(bool)
@@ -1347,13 +1365,7 @@ if page == "📄 SPEC & COA Generator":
         except TypeError:
             panel = st.container()
     with panel:
-        if hasattr(st, "segmented_control"):
-            doc_type = st.segmented_control("Create", ["COA", "SPEC", "COA + SPEC"], default="COA",
-                                            key="gen_doctype") or "COA"
-        else:
-            doc_type = st.radio("Create", ["COA", "SPEC", "COA + SPEC"], horizontal=True, key="gen_doctype")
-        kinds = ["COA", "SPEC"] if doc_type == "COA + SPEC" else [doc_type]
-
+        st.markdown(f"**Creating: {' + '.join(kinds)}**")
         missing_tpl = [k for k in kinds if not os.path.isfile(TEMPLATES[k])]
         with st.expander("Templates", expanded=bool(missing_tpl)):
             for k in ("COA", "SPEC"):
@@ -1403,11 +1415,17 @@ if page == "📄 SPEC & COA Generator":
             bad = {m.split(":")[0].replace("[COA] ", "") for lvl, m in checks if lvl == "error"}
             show_res = "COA" in kinds and doc_type != "SPEC"
             e = lambda x: _html.escape(str(x or ""))
-            hdr = [("Product Name", fields["ProductName"], "Brand", "Skyherb®"),
-                   ("Lot No.", fields["LotNo"], "Quantity", fields["Quantity"]),
-                   ("Mfg. Date", fields["ManuDate"], "Shelf Life", fields["ShelfLife"]),
-                   ("Plant Part", fields["PlantPart"], "Plant Latin Name", fields["LatinName"]),
-                   ("Country of Origin", fields["Origin"], "Solvent", fields["Solvent"])]
+            if show_res:
+                hdr = [("Product Name", fields["ProductName"], "Brand", "Skyherb®"),
+                       ("Lot No.", fields["LotNo"], "Quantity", fields["Quantity"]),
+                       ("Mfg. Date", fields["ManuDate"], "Shelf Life", fields["ShelfLife"]),
+                       ("Plant Part", fields["PlantPart"], "Plant Latin Name", fields["LatinName"]),
+                       ("Country of Origin", fields["Origin"], "Solvent", fields["Solvent"])]
+            else:
+                hdr = [("Product Name", fields["ProductName"], "Brand", "Skyherb®"),
+                       ("Extraction Solvent", fields["Solvent"], "Shelf Life", fields["ShelfLife"]),
+                       ("Plant Part", fields["PlantPart"], "Plant Latin Name", fields["LatinName"]),
+                       ("Country of origin", fields["Origin"], "", "")]
             h = ["<div class='sn-doc'><h4>" + ("CERTIFICATE OF ANALYSIS" if show_res else "PRODUCT SPECIFICATIONS")
                  + "</h4><table>"]
             h += [f"<tr><td class='lbl'>{e(a)}</td><td>{e(b)}</td><td class='lbl'>{e(c)}</td><td>{e(d)}</td></tr>"
@@ -1419,11 +1437,13 @@ if page == "📄 SPEC & COA Generator":
             for r in [r for r in rows if r.get("Include", True)]:
                 if r.get("Group") != last:
                     label = "Microbiological Specifications" if r.get("Group") == "Microbiological" else r.get("Group")
-                    if group_headings or r.get("Group") == "Microbiological":
+                    if r.get("Group") == "Microbiological" or r.get("Group") in cg.BANNER_GROUPS:
+                        h.append(f"<tr class='ban'><td colspan='{ncol}'>{e(label)}</td></tr>")
+                    elif group_headings:
                         h.append(f"<tr class='grp'><td colspan='{ncol}'>{e(label)}</td></tr>")
                     last = r.get("Group")
                 cls = " class='bad'" if r.get("Characteristic") in bad else ""
-                h.append(f"<tr{cls}><td>{e(r.get('Characteristic'))}</td><td class='c'>{e(r.get('Standards'))}</td>"
+                h.append(f"<tr{cls}><td><b>{e(r.get('Characteristic'))}</b></td><td class='c'>{e(r.get('Standards'))}</td>"
                          + (f"<td class='c'>{e(r.get('Results'))}</td>" if show_res else "")
                          + f"<td class='c'>{e(r.get('Methods'))}</td></tr>")
             h.append("</table></div>")
