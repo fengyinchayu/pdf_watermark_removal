@@ -1097,109 +1097,388 @@ def chips(items, empty="No changes yet"):
 # ==============================
 
 if page == "📄 SPEC & COA Generator":
+    import html as _html
+    import pandas as pd
+    import coa_review as cr
+    import coa_generator as cg
 
-    st.title("📄 SPEC & COA Generator")
+    def _secret(name):
+        try:
+            return st.secrets.get(name)
+        except Exception:
+            return None
 
-    st.subheader("Upload Supplier Documents")
+    API_KEY = _secret("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    MODEL = _secret("COA_MODEL") or os.environ.get("COA_MODEL") or cr.DEFAULT_MODEL
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    TEMPLATES = {"COA": os.path.join(APP_DIR, "templates", "Internal_COA_Template.docx"),
+                 "SPEC": os.path.join(APP_DIR, "templates", "Internal_SPEC_Template.docx")}
+    LIB_PATH = os.path.join(APP_DIR, "spec_library.xlsx")
+    FIELDS = [("ProductName", "Product name"), ("LotNo", "Lot No."), ("Quantity", "Quantity"),
+              ("ManuDate", "Mfg. date"), ("ExpiryDate", "Expiry date"), ("ShelfLife", "Shelf life"),
+              ("PlantPart", "Plant part"), ("LatinName", "Plant Latin name"),
+              ("Origin", "Country of origin"), ("Solvent", "Extraction solvent")]
+    NONE = "— not in spec library —"
 
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        spec_pdf = st.file_uploader("Upload Supplier SPEC (PDF)", type="pdf", key="spec_uploader")
-    with col_up2:
-        coa_pdf  = st.file_uploader("Upload Supplier COA (PDF)",  type="pdf", key="coa_uploader")
+    st.session_state.setdefault("gen_rows", [])
+    st.session_state.setdefault("gen_rows_v", 0)
+    st.session_state.setdefault("gen_msgs", [])
+    for k, _ in FIELDS:
+        st.session_state.setdefault(f"gen_f_{k}", "China" if k == "Origin" else "")
 
-    extract_col1, extract_col2 = st.columns(2)
+    @st.cache_data(show_spinner=False, max_entries=8)
+    def _gen_lib(path, mtime):
+        return cr.load_spec_library(path)
 
-    with extract_col1:
-        if spec_pdf and st.button("🔍 Extract Info from SPEC PDF"):
-            with st.spinner("Extracting..."):
-                extracted = extract_header_info(spec_pdf)
-            if extracted:
-                for key, value in extracted.items():
-                    st.session_state[key] = value
-                st.success(f"Extracted {len(extracted)} field(s) from SPEC PDF. Review and edit below.")
+    specs_df = products_df = None
+    if os.path.isfile(LIB_PATH):
+        try:
+            specs_df, products_df = _gen_lib(LIB_PATH, os.path.getmtime(LIB_PATH))
+        except Exception:
+            pass
+    lib_products = list(products_df["Product"]) if products_df is not None else []
+
+    @st.cache_data(show_spinner=False, max_entries=32)
+    def _gen_read_ai(data, filename, api_key, model):
+        return cr.ai_extract_coa(cr.make_client(api_key), model, data, filename)
+
+    def _gen_reset():
+        for k, _ in FIELDS:
+            st.session_state[f"gen_f_{k}"] = "China" if k == "Origin" else ""
+        st.session_state["gen_rows"] = []
+        st.session_state["gen_rows_v"] += 1
+        st.session_state["gen_msgs"] = []
+        st.session_state.pop("gen_out", None)
+        st.session_state["gen_product"] = NONE
+
+    def _gen_read():
+        """Read the uploaded supplier document into the form (runs before the widgets are drawn)."""
+        f = st.session_state.get("gen_upload")
+        msgs = []
+        if f is None:
+            return
+        data, name = f.getvalue(), f.name
+        coa = None
+        if st.session_state.get("gen_use_ai") and API_KEY:
+            try:
+                coa = _gen_read_ai(data, name, API_KEY, MODEL)
+            except Exception as e:
+                msgs.append(("warning", f"AI reading failed ({e}); used the text reader instead."))
+        if coa is None and name.lower().endswith(".pdf"):
+            try:
+                coa = cr.extract_text_coa(data)
+            except Exception as e:
+                msgs.append(("error", f"Couldn't read the PDF: {e}"))
+        if coa is None or (not coa["tests"] and coa.get("scanned", True)):
+            msgs.append(("error", "No text could be read — this looks like a scan. Turn on “Read with AI”."
+                          if not API_KEY or not st.session_state.get("gen_use_ai") else
+                          "No test rows could be read from this document."))
+            st.session_state["gen_msgs"] = msgs
+            return
+        info = coa["info"]
+
+        # our product in the spec library
+        prod, score = (cr.match_product(info.get("product_name", ""), products_df)
+                       if products_df is not None else (None, 0))
+        st.session_state["gen_product"] = prod or NONE
+        pinfo = cr.product_info(products_df, prod) if prod else {}
+
+        shelf = cg.shelf_life_text(info.get("shelf_life", ""),
+                                   pinfo.get("Shelf life (months)") if re.fullmatch(
+                                       r"\d+(\.0)?", pinfo.get("Shelf life (months)", "") or "") else None)
+        values = {
+            "ProductName": prod or info.get("product_name", ""),
+            "LotNo": info.get("lot_no", ""), "Quantity": info.get("quantity", ""),
+            "ManuDate": info.get("mfg_date", ""),
+            "ExpiryDate": info.get("expiry_date", "") or info.get("retest_date", ""),
+            "ShelfLife": shelf,
+            "PlantPart": pinfo.get("Plant part") or info.get("plant_part", ""),
+            "LatinName": pinfo.get("Latin name") or info.get("latin_name", ""),
+            "Origin": st.session_state.get("gen_f_Origin") or "China",
+            "Solvent": pinfo.get("Extraction solvent") or info.get("solvent", ""),
+        }
+        values["PlantPart"] = re.sub(r"^(used|part)\s*:?\s*", "", values["PlantPart"], flags=re.I)
+        if not values["ExpiryDate"]:
+            exp = cg.expiry_from(values["ManuDate"], shelf)
+            if exp:
+                values["ExpiryDate"] = exp.isoformat()
+                msgs.append(("info", "Expiry date calculated from the mfg. date and shelf life."))
+        for k, v in values.items():
+            st.session_state[f"gen_f_{k}"] = cr.norm_text(v)
+
+        terms = cg.supplier_terms_from(info)
+        rows = cg.rows_from_supplier(coa["tests"], st.session_state.get("gen_our_names", True), terms)
+        if prod and st.session_state.get("gen_our_spec", False):
+            rows = cg.apply_our_spec(rows, cr.spec_rows_for(specs_df, prod))
+        st.session_state["gen_rows"] = rows
+        st.session_state["gen_rows_v"] += 1
+        st.session_state.pop("gen_out", None)
+        src = "AI" if coa["source"] == "ai" else "text reader"
+        msgs.insert(0, ("success", f"Read {len(rows)} test rows with the {src}"
+                        + (f"; matched to “{prod}” in the spec library." if prod else ".")))
+        if info.get("product_name") and prod and cr.clean_name(info["product_name"]) != cr.clean_name(prod):
+            msgs.append(("info", f"Supplier calls it “{info['product_name']}”; using our name “{prod}”."))
+        if info.get("supplier"):
+            msgs.append(("info", f"Supplier on the document: {info['supplier']} — left out of our document."))
+        for w in coa.get("warnings", []):
+            msgs.append(("warning", f"AI note: {w}"))
+        st.session_state["gen_msgs"] = msgs
+
+    def _gen_apply_spec():
+        prod = st.session_state.get("gen_product")
+        if not prod or prod == NONE or specs_df is None:
+            return
+        rows = st.session_state.get("gen_rows_current") or st.session_state["gen_rows"]
+        st.session_state["gen_rows"] = cg.apply_our_spec(rows, cr.spec_rows_for(specs_df, prod))
+        st.session_state["gen_rows_v"] += 1
+        st.session_state["gen_msgs"] = [("success", f"Standards replaced with our spec for “{prod}”; "
+                                                    "tests our spec requires but the supplier didn't report were added.")]
+
+    # sticky right column
+    st.markdown("""
+        <style>
+        div[data-testid="stColumn"]:has(.st-key-gen_panel), div[data-testid="column"]:has(.st-key-gen_panel) {
+            position: sticky; top: 3.75rem; align-self: flex-start;
+            max-height: calc(100vh - 4.5rem); overflow-y: auto; padding-right: 6px;
+        }
+        .sn-doc {font-family: 'Times New Roman', serif; font-size: 12px; color: #111; background: #fff;
+                 border: 1px solid rgba(128,128,128,.35); border-radius: 4px; padding: 14px 16px;}
+        .sn-doc h4 {text-align: center; margin: 0 0 8px 0; font-size: 16px; color: #111;}
+        .sn-doc table {width: 100%; border-collapse: collapse; margin-bottom: 6px;}
+        .sn-doc td, .sn-doc th {border: 1px solid #2e8b57; padding: 2px 5px; font-size: 11px; color: #111;}
+        .sn-doc th {background: #c0c0c0; font-size: 12px;}
+        .sn-doc td.lbl {font-weight: bold; width: 18%;}
+        .sn-doc tr.grp td {background: #eef4f1; font-style: italic; font-weight: bold;}
+        .sn-doc tr.bad td {background: #fde2e1;}
+        .sn-doc td.c {text-align: center;}
+        </style>""", unsafe_allow_html=True)
+
+    # ── header ────────────────────────────────────────────────────────────
+    h1, h2 = st.columns([5, 1])
+    with h1:
+        st.title("📄 SPEC & COA Generator")
+        st.markdown("<div class='sn-hint'>Upload a supplier COA or specification → check the fields and rows → "
+                    "download a Skyherb COA / SPEC built from your Word templates.</div>", unsafe_allow_html=True)
+    with h2:
+        st.write("")
+        st.button("↺ Start over", key="gen_reset", on_click=_gen_reset)
+    if API_KEY:
+        st.markdown(chips([f"🤖 AI reading · {MODEL}"] + ([f"📚 {len(lib_products)} product spec(s)"]
+                                                           if lib_products else [])), unsafe_allow_html=True)
+
+    left, right = st.columns([1.15, 1], gap="large")
+
+    # ════════════════════════════ left: inputs ═══════════════════════════
+    with left:
+        st.subheader("① Supplier document")
+        st.file_uploader("Supplier COA or specification (PDF or image)", type=["pdf", "png", "jpg", "jpeg"],
+                         key="gen_upload")
+        r1, r2, r3 = st.columns([1.1, 1.3, 1])
+        with r1:
+            st.toggle("Read with AI", value=bool(API_KEY), disabled=not API_KEY, key="gen_use_ai",
+                      help="Reads any layout, including scans. Without AI, only text PDFs with tables can be read.")
+        with r2:
+            st.toggle("Use Skyherb test names", value=True, key="gen_our_names",
+                      help="E.g. 'Pb' → 'Lead (Pb)', 'Aerobic bacterial count' → 'Total Plate Count'.")
+        with r3:
+            _stretch_call(st.button, "📖 Read document", type="primary", key="gen_read", on_click=_gen_read,
+                          disabled=st.session_state.get("gen_upload") is None)
+        for level, msg in st.session_state["gen_msgs"]:
+            getattr(st, level)(msg)
+
+        st.subheader("② Product & batch")
+        pc1, pc2 = st.columns([2, 1])
+        with pc1:
+            st.selectbox("Our product (spec library)", [NONE] + lib_products, key="gen_product",
+                         help="Used for the product details and, if you choose, our spec limits.")
+        with pc2:
+            date_fmt = st.selectbox("Date format", list(cg.DATE_FORMATS), key="gen_datefmt")
+        fc1, fc2 = st.columns(2)
+        for i, (k, label) in enumerate(FIELDS):
+            with (fc1 if i % 2 == 0 else fc2):
+                st.text_input(label, key=f"gen_f_{k}")
+
+        st.subheader("③ Tests")
+        o1, o2 = st.columns([1.3, 1])
+        with o1:
+            st.button("📐 Use our spec limits for Standards", key="gen_apply_spec", on_click=_gen_apply_spec,
+                      disabled=st.session_state.get("gen_product", NONE) == NONE,
+                      help="Replaces the supplier's limits with the spec library's, and adds required tests "
+                           "the supplier didn't report (fill in their results).")
+        with o2:
+            group_headings = st.toggle("Group headings", value=True, key="gen_groups",
+                                       help="Sub-headings such as 'Heavy Metals' inside the table.")
+        cols = ["Include", "Group", "Characteristic", "Standards", "Results", "Methods", "Supplier info?"]
+        base = pd.DataFrame(st.session_state["gen_rows"] or [], columns=cols)
+        base["Include"] = base["Include"].fillna(True).astype(bool)
+        base["Supplier info?"] = base["Supplier info?"].fillna(False).astype(bool)
+        edited = st.data_editor(
+            base, num_rows="dynamic", hide_index=True, key=f"gen_rows_ed_{st.session_state['gen_rows_v']}",
+            column_config={
+                "Include": st.column_config.CheckboxColumn(default=True, width="small"),
+                "Group": st.column_config.SelectboxColumn(options=cg.GROUPS, default="Physical & Chemical",
+                                                          required=True),
+                "Characteristic": st.column_config.TextColumn(width="medium"),
+                "Standards": st.column_config.TextColumn(width="medium"),
+                "Results": st.column_config.TextColumn(width="small"),
+                "Supplier info?": st.column_config.CheckboxColumn("⚠️ Supplier info", disabled=True,
+                                                                  width="small"),
+            })
+        edited = edited.astype(object).where(edited.notna(), "")
+        rows = [r for r in edited.to_dict("records") if str(r.get("Characteristic", "")).strip()]
+        for r in rows:
+            r["Include"] = bool(r.get("Include", True)) if r.get("Include", "") != "" else True
+        order = {g: i for i, g in enumerate(cg.GROUPS)}
+        rows.sort(key=lambda r: order.get(r.get("Group"), 0))
+        st.session_state["gen_rows_current"] = rows
+        st.caption("Untick rows you don't want, edit any cell, or add rows at the bottom. "
+                   "Microbiological rows go under the template's micro section.")
+
+    # ════════════════════════════ right: checks, preview, export ═════════
+    fields = {k: st.session_state.get(f"gen_f_{k}", "").strip() for k, _ in FIELDS}
+    for k in ("ManuDate", "ExpiryDate"):
+        fields[k] = cg.format_date(fields[k], date_fmt) if fields[k] else ""
+    fields["Brand"] = "Skyherb®"
+    fields["IssueDate"] = cg.format_date(datetime.today().strftime("%Y-%m-%d"), date_fmt)
+
+    with right:
+        try:
+            panel = st.container(key="gen_panel")
+        except TypeError:
+            panel = st.container()
+    with panel:
+        if hasattr(st, "segmented_control"):
+            doc_type = st.segmented_control("Create", ["COA", "SPEC", "COA + SPEC"], default="COA",
+                                            key="gen_doctype") or "COA"
+        else:
+            doc_type = st.radio("Create", ["COA", "SPEC", "COA + SPEC"], horizontal=True, key="gen_doctype")
+        kinds = ["COA", "SPEC"] if doc_type == "COA + SPEC" else [doc_type]
+
+        missing_tpl = [k for k in kinds if not os.path.isfile(TEMPLATES[k])]
+        with st.expander("Templates", expanded=bool(missing_tpl)):
+            for k in ("COA", "SPEC"):
+                up = st.file_uploader(f"Use a different {k} template for this session (.docx)", type="docx",
+                                      key=f"gen_tpl_{k}")
+                if up is not None:
+                    st.session_state[f"gen_tpl_bytes_{k}"] = up.getvalue()
+            st.caption("Templates use placeholders such as {{ProductName}}, {{LotNo}}, {{Quantity}}, {{ManuDate}}, "
+                       "{{ExpiryDate}}, {{ShelfLife}}, {{PlantPart}}, {{LatinName}}, {{Origin}}, {{Solvent}}, "
+                       "{{IssueDate}}, and a table row with 'Characteristic | Standards | (Results) | Methods'.")
+
+        def _tpl(kind):
+            return st.session_state.get(f"gen_tpl_bytes_{kind}") or (
+                open(TEMPLATES[kind], "rb").read() if os.path.isfile(TEMPLATES[kind]) else None)
+
+        # ── checks ──
+        st.markdown("**✅ Checks before issuing**")
+        checks = []
+        for k in kinds:
+            checks += [(lvl, (f"[{k}] " if len(kinds) > 1 else "") + m) for lvl, m in cg.check_rows(rows, fields, k)]
+        for k in kinds:
+            tb = _tpl(k)
+            if tb:
+                try:
+                    from docx import Document as _D
+                    have = cg.placeholders_in(_D(io.BytesIO(tb)))
+                    if "ExpiryDate" not in have and fields.get("ExpiryDate") and k == "COA":
+                        checks.append(("info", "The COA template has no {{ExpiryDate}} placeholder, so the expiry "
+                                               "date won't appear. Add it to the template in Word to show it."))
+                except Exception:
+                    pass
             else:
-                st.warning("No recognisable header fields found in the SPEC PDF.")
+                checks.append(("error", f"No {k} template found (templates/Internal_{k}_Template.docx)."))
+        errors = [m for lvl, m in checks if lvl == "error"]
+        if not rows:
+            st.caption("Read a document (or add rows) to see the checks.")
+        elif not checks:
+            st.success("No problems found.")
+        else:
+            icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}
+            st.markdown("\n".join(f"- {icon[l]} {m.replace('{{', '{{ ').replace('}}', ' }}')}"
+                                   for l, m in checks))
 
-    with extract_col2:
-        if coa_pdf and st.button("🔍 Extract Info from COA PDF"):
-            with st.spinner("Extracting..."):
-                extracted = extract_header_info(coa_pdf)
-            if extracted:
-                for key, value in extracted.items():
-                    st.session_state[key] = value
-                st.success(f"Extracted {len(extracted)} field(s) from COA PDF. Review and edit below.")
-            else:
-                st.warning("No recognisable header fields found in the COA PDF.")
+        # ── preview ──
+        st.markdown("**👁️ Preview**")
+        if rows:
+            bad = {m.split(":")[0].replace("[COA] ", "") for lvl, m in checks if lvl == "error"}
+            show_res = "COA" in kinds and doc_type != "SPEC"
+            e = lambda x: _html.escape(str(x or ""))
+            hdr = [("Product Name", fields["ProductName"], "Brand", "Skyherb®"),
+                   ("Lot No.", fields["LotNo"], "Quantity", fields["Quantity"]),
+                   ("Mfg. Date", fields["ManuDate"], "Shelf Life", fields["ShelfLife"]),
+                   ("Plant Part", fields["PlantPart"], "Plant Latin Name", fields["LatinName"]),
+                   ("Country of Origin", fields["Origin"], "Solvent", fields["Solvent"])]
+            h = ["<div class='sn-doc'><h4>" + ("CERTIFICATE OF ANALYSIS" if show_res else "PRODUCT SPECIFICATIONS")
+                 + "</h4><table>"]
+            h += [f"<tr><td class='lbl'>{e(a)}</td><td>{e(b)}</td><td class='lbl'>{e(c)}</td><td>{e(d)}</td></tr>"
+                  for a, b, c, d in hdr]
+            h.append("</table><table><tr><th>Characteristic</th><th>Standards</th>"
+                     + ("<th>Results</th>" if show_res else "") + "<th>Methods</th></tr>")
+            last = None
+            ncol = 4 if show_res else 3
+            for r in [r for r in rows if r.get("Include", True)]:
+                if r.get("Group") != last:
+                    label = "Microbiological Specifications" if r.get("Group") == "Microbiological" else r.get("Group")
+                    if group_headings or r.get("Group") == "Microbiological":
+                        h.append(f"<tr class='grp'><td colspan='{ncol}'>{e(label)}</td></tr>")
+                    last = r.get("Group")
+                cls = " class='bad'" if r.get("Characteristic") in bad else ""
+                h.append(f"<tr{cls}><td>{e(r.get('Characteristic'))}</td><td class='c'>{e(r.get('Standards'))}</td>"
+                         + (f"<td class='c'>{e(r.get('Results'))}</td>" if show_res else "")
+                         + f"<td class='c'>{e(r.get('Methods'))}</td></tr>")
+            h.append("</table></div>")
+            st.markdown("".join(h), unsafe_allow_html=True)
+            st.caption("Quick preview of the content. The downloaded file uses your Word template's exact layout.")
+        else:
+            st.caption("Nothing to preview yet.")
 
-    st.divider()
+        # ── generate ──
+        st.markdown("**📦 Download**")
+        ok_anyway = True
+        if errors:
+            ok_anyway = st.checkbox(f"Create anyway ({len(errors)} problem(s) above)", key="gen_override")
+        if _stretch_call(st.button, "⚙️ Create document" + ("s" if len(kinds) > 1 else ""), type="primary",
+                         key="gen_go", disabled=not rows or not ok_anyway):
+            out = {}
+            safe = lambda s: re.sub(r"[^\w.\-]+", "_", s).strip("_")[:60]
+            for k in kinds:
+                tb = _tpl(k)
+                if not tb:
+                    continue
+                try:
+                    docx_bytes = cg.fill_template(tb, fields, rows, k, group_headings)
+                    stem = f"SN-{k}-{safe(fields['ProductName'] or 'product')}" + (
+                        f"-{safe(fields['LotNo'])}" if k == "COA" and fields["LotNo"] else "")
+                    out[k] = {"docx": docx_bytes, "stem": stem, "pdf": cg.docx_to_pdf(docx_bytes)}
+                    with open(os.path.join("outputs", stem + ".docx"), "wb") as f:
+                        f.write(docx_bytes)
+                except Exception as ex:
+                    st.error(f"Couldn't create the {k}: {ex}")
+            st.session_state["gen_out"] = out
 
-    st.subheader("Product & Batch Information")
-    st.caption("Fields are pre-filled from the PDF after clicking Extract. You can edit any value before generating.")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        product_name = st.text_input("Product Name",       value=st.session_state["product_name"], key="in_product_name")
-        brand        = st.text_input("Brand",               value=st.session_state["brand"],        key="in_brand")
-        lot_no       = st.text_input("Lot No.",             value=st.session_state["lot_no"],        key="in_lot_no")
-        quantity     = st.text_input("Quantity",            value=st.session_state["quantity"],      key="in_quantity")
-        mfg_date     = st.text_input("Mfg. Date",          value=st.session_state["mfg_date"],      key="in_mfg_date")
-        expiry_date  = st.text_input("Expiry Date",        value=st.session_state["expiry_date"],   key="in_expiry_date")
-
-    with col2:
-        shelf_life   = st.text_input("Shelf Life",         value=st.session_state["shelf_life"],    key="in_shelf_life")
-        plant_part   = st.text_input("Plant Part",         value=st.session_state["plant_part"],    key="in_plant_part")
-        latin_name   = st.text_input("Plant Latin Name",   value=st.session_state["latin_name"],    key="in_latin_name")
-        origin       = st.text_input("Country of Origin",  value=st.session_state["origin"],        key="in_origin")
-        solvent      = st.text_input("Extraction Solvent", value=st.session_state["solvent"],       key="in_solvent")
-
-    header_data = {
-        "ProductName": product_name,
-        "Brand":       brand,
-        "Origin":      origin,
-        "Solvent":     solvent,
-        "PlantPart":   plant_part,
-        "LatinName":   latin_name,
-        "ShelfLife":   shelf_life,
-        "LotNo":       lot_no,
-        "Quantity":    quantity,
-        "ManuDate":    mfg_date,
-        "ExpiryDate":  expiry_date,
-        "IssueDate":   datetime.today().strftime("%Y-%m-%d"),
-    }
-
-    st.divider()
-
-    gen_col1, gen_col2 = st.columns(2)
-
-    with gen_col1:
-        if spec_pdf and st.button("⚙️ Generate Internal SPEC"):
-            with st.spinner("Generating SPEC..."):
-                general_rows, micro_rows = extract_spec_tables(spec_pdf)
-                output_file = fill_spec_template(header_data, general_rows, micro_rows)
-            if output_file:
-                with open(output_file, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download SPEC",
-                        f,
-                        file_name="Internal_SPEC.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-
-    with gen_col2:
-        if coa_pdf and st.button("⚙️ Generate Internal COA"):
-            with st.spinner("Generating COA..."):
-                general_rows, micro_rows = extract_coa_tables(coa_pdf)
-                output_file = fill_coa_template(header_data, general_rows, micro_rows)
-            if output_file:
-                with open(output_file, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download COA",
-                        f,
-                        file_name="Internal_COA.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
+        out = st.session_state.get("gen_out") or {}
+        for k, o in out.items():
+            c1, c2 = st.columns(2)
+            with c1:
+                _stretch_call(st.download_button, f"⬇️ {k} (Word)", o["docx"], file_name=o["stem"] + ".docx",
+                              mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                              key=f"gen_dl_docx_{k}")
+            with c2:
+                if o["pdf"]:
+                    _stretch_call(st.download_button, f"⬇️ {k} (PDF)", o["pdf"], file_name=o["stem"] + ".pdf",
+                                  mime="application/pdf", key=f"gen_dl_pdf_{k}")
+            if o["pdf"]:
+                with st.expander(f"Exact preview — {k}"):
+                    try:
+                        import fitz as _fz
+                    except ImportError:
+                        import pymupdf as _fz
+                    d = _fz.open(stream=o["pdf"], filetype="pdf")
+                    for pg in d:
+                        pix = pg.get_pixmap(dpi=80)
+                        _stretch_call(st.image, pix.tobytes("png"))
+        if out and not any(o["pdf"] for o in out.values()):
+            st.caption("PDF download needs LibreOffice on the server; open the Word file and save as PDF instead.")
 
 
 # ==============================
