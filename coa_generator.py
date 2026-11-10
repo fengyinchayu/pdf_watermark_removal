@@ -20,23 +20,28 @@ import coa_review as cr
 # Rows
 # ======================================================================
 
+# Skyherb house names (as on our SPEC sheets); None = keep the supplier's wording
 DISPLAY_NAMES = {
-    "lead": "Lead (Pb)", "arsenic": "Arsenic (As)", "cadmium": "Cadmium (Cd)", "mercury": "Mercury (Hg)",
-    "heavy metals": "Heavy Metals", "total plate count": "Total Plate Count", "yeast & mold": "Yeast & Mold",
+    "lead": "Lead", "arsenic": "Arsenic", "cadmium": "Cadmium", "mercury": "Mercury",
+    "heavy metals": "Heavy Metals", "total plate count": "Total Aerobic", "yeast & mold": "Mold and Yeast",
     "yeast": "Yeast", "mold": "Mold", "e. coli": "E. coli", "salmonella": "Salmonella",
-    "staphylococcus aureus": "Staphylococcus aureus", "coliforms": "Coliforms",
-    "enterobacteriaceae": "Enterobacteriaceae", "listeria": "Listeria", "loss on drying": "Loss on Drying",
-    "ash": "Ash", "sulfated ash": "Sulfated Ash", "bulk density": "Bulk Density", "tapped density": "Tapped Density",
-    "particle size": "Particle Size", "appearance": "Appearance", "odor & taste": "Odor & Taste",
+    "staphylococcus aureus": "Staphylococcus aureus", "coliforms": "Coliform",
+    "enterobacteriaceae": "Enterobacteriaceae", "listeria": "Listeria", "loss on drying": "Loss on drying",
+    "ash": None, "sulfated ash": None, "bulk density": "Bulk Density", "tapped density": "Tapped Density",
+    "particle size": "Particle Size", "appearance": "Appearance*", "odor & taste": None,
     "identification": "Identification", "pesticides": "Pesticide Residues", "residual solvents": "Residual Solvents",
     "aflatoxins": "Aflatoxins", "pah": "PAHs", "ph": "pH", "solubility": "Solubility",
 }
 
-GROUPS = ["Assay & Identification", "Physical & Chemical", "Heavy Metals", "Contaminants", "Microbiological"]
+# order of sections on our documents; the banner groups always get a heading row (house style)
+GROUPS = ["Physical & Chemical", "Assay & Identification", "Heavy Metals", "Solvents Residue",
+          "Pesticides & Contaminants", "Microbiological"]
+BANNER_GROUPS = {"Solvents Residue", "Pesticides & Contaminants"}
 _GROUP_OF_CAT = {"assay": "Assay & Identification", "identification": "Assay & Identification",
                  "physical": "Physical & Chemical", "heavy metals": "Heavy Metals",
-                 "residual solvents": "Contaminants", "pesticides": "Contaminants", "contaminants": "Contaminants",
-                 "microbiology": "Microbiological"}
+                 "residual solvents": "Solvents Residue", "pesticides": "Pesticides & Contaminants",
+                 "contaminants": "Pesticides & Contaminants", "microbiology": "Microbiological"}
+_MICRO_UNITS = {"cfu/g": "CFU/g", "mpn/g": "MPN/g", "cfu/ml": "CFU/mL", "mpn/100g": "MPN/100g"}
 
 # rows that are really header information / column titles, not tests
 _JUNK = re.compile(
@@ -58,7 +63,9 @@ def display_name(name, use_ours=True):
     if not use_ours:
         return raw
     c = cr.canon(raw)
-    if c in DISPLAY_NAMES:
+    if re.search(r"\((?:cfu|mpn)", raw, re.I):        # already in house form, e.g. "Total Aerobic (CFU/g)"
+        return raw
+    if DISPLAY_NAMES.get(c):
         return DISPLAY_NAMES[c]
     # keep the supplier's wording for assay markers etc., tidied
     return raw[:1].upper() + raw[1:] if raw else raw
@@ -68,6 +75,8 @@ def group_of(name, category=""):
     known = cr.CATEGORY_OF.get(cr.canon(name))
     if known:                                  # our standard group for known tests, whatever the supplier used
         return _GROUP_OF_CAT.get(known, "Physical & Chemical")
+    if re.search(cr._SOLVENTS, cr.clean_name(name)):
+        return "Solvents Residue"
     cat = cr.category_of(name, category or "")
     if cat not in _GROUP_OF_CAT:
         cat = cr.category_of(name, "")
@@ -121,9 +130,26 @@ def rows_from_supplier(tests, use_our_names=True, supplier_terms=()):
             "Methods": cr.norm_text(t.get("method")),
             "Supplier info?": flagged,
         })
+    rows = [house_micro(r) for r in rows]
     order = {g: i for i, g in enumerate(GROUPS)}
     rows.sort(key=lambda r: order.get(r["Group"], 0))          # stable: keeps supplier order inside a group
     return rows
+
+
+def house_micro(r):
+    """Microbiology in house style: 'Total Aerobic (CFU/g)' | '≤1000' | '<10'."""
+    if r.get("Group") != "Microbiological":
+        return r
+    unit = cr.find_unit(r.get("Standards")) or cr.find_unit(r.get("Results"))
+    if unit not in _MICRO_UNITS:
+        return r
+    r = dict(r)
+    if not re.search(r"\((?:cfu|mpn)", r["Characteristic"], re.I):
+        r["Characteristic"] = f"{r['Characteristic']} ({_MICRO_UNITS[unit]})"
+    rx = re.compile(r"\s*" + r"\s*".join(re.escape(ch) for ch in unit), re.I)
+    for k in ("Standards", "Results"):
+        r[k] = rx.sub("", str(r.get(k) or "")).strip()
+    return r
 
 
 def pretty_limit_text(s):
@@ -140,15 +166,13 @@ def format_limit(lim):
     """Our spec limit -> COA wording: '≥ 50%', '≤ 1 ppm', '4.5-7.0', 'Negative/25g'."""
     def num(v):
         return cr.fmt_num(v).replace("10^", "10")
-    u = lim.unit or ""
-    sep = "" if u in ("%",) else " "
-    us = f"{sep}{u}" if u else ""
+    us = {"g/ml": "g/mL", "cfu/g": "CFU/g", "mpn/g": "MPN/g"}.get(lim.unit or "", lim.unit or "")
     if lim.min is not None and lim.max is not None:
         return f"{num(lim.min)}-{num(lim.max)}{us}"
     if lim.max is not None:
-        return f"{'≤' if lim.max_incl else '<'} {num(lim.max)}{us}"
+        return f"{'≤' if lim.max_incl else '<'}{num(lim.max)}{us}"
     if lim.min is not None:
-        return f"{'≥' if lim.min_incl else '>'} {num(lim.min)}{us}"
+        return f"{'≥' if lim.min_incl else '>'}{num(lim.min)}{us}"
     return lim.text or lim.expected or ""
 
 
@@ -182,6 +206,7 @@ def apply_our_spec(rows, spec_rows, add_missing=True):
             out.append({"Include": True, "Group": _GROUP_OF_CAT.get(sr["category"], "Assay & Identification"),
                         "Characteristic": display_name(sr["test"]), "Standards": format_limit(sr["limit"]),
                         "Results": "", "Methods": sr["method"], "Supplier info?": False, "From our spec": True})
+    out = [house_micro(r) for r in out]
     order = {g: i for i, g in enumerate(GROUPS)}
     out.sort(key=lambda r: order.get(r["Group"], 0))
     return out
@@ -351,7 +376,7 @@ def _col_roles(tr):
     return roles
 
 
-def _set_tc_text(tc, text, bold=False, italic=False, size=20, align=None):
+def _set_tc_text(tc, text, bold=False, italic=False, size=21, align=None, font=None, indent=80):
     """Replace a cell's content with one paragraph/run, keeping the cell's own properties."""
     for p in tc.findall(_q("p"))[1:]:
         tc.remove(p)
@@ -369,8 +394,8 @@ def _set_tc_text(tc, text, bold=False, italic=False, size=20, align=None):
     for tag in ("spacing", "ind", "jc", "rPr"):
         for el in ppr.findall(_q(tag)):
             ppr.remove(el)
-    sp = ppr.makeelement(_q("spacing"), {_q("before"): "20", _q("after"): "20"})
-    ind = ppr.makeelement(_q("ind"), {_q("left"): "80", _q("right"): "60"})
+    sp = ppr.makeelement(_q("spacing"), {_q("before"): "40", _q("after"): "40"})
+    ind = ppr.makeelement(_q("ind"), {_q("left"): str(indent), _q("right"): "60"})
     ppr.append(sp)
     ppr.append(ind)
     if align:
@@ -379,6 +404,8 @@ def _set_tc_text(tc, text, bold=False, italic=False, size=20, align=None):
     for li, line in enumerate(lines):
         r = p.makeelement(_q("r"), {})
         rpr = r.makeelement(_q("rPr"), {})
+        if font:
+            rpr.append(rpr.makeelement(_q("rFonts"), {_q("ascii"): font, _q("hAnsi"): font, _q("cs"): font}))
         if bold:
             rpr.append(rpr.makeelement(_q("b"), {}))
         if italic:
@@ -400,7 +427,7 @@ def _clean_row(proto):
     trpr = tr.find(_q("trPr"))
     if trpr is not None:
         for h in trpr.findall(_q("trHeight")):
-            h.set(_q("val"), "300")
+            h.set(_q("val"), "340")
             h.set(_q("hRule"), "atLeast")
         for el in trpr.findall(_q("tblHeader")):
             trpr.remove(el)
@@ -418,7 +445,31 @@ def _clean_row(proto):
 def _data_row(proto, roles, row):
     tr = _clean_row(proto)
     for tc, role in zip(tr.findall(_q("tc")), roles):
-        _set_tc_text(tc, row.get(role, ""), align=None if role == "Characteristic" else "center")
+        if role == "Characteristic":
+            _set_tc_text(tc, row.get(role, ""), bold=True, font="Times New Roman", indent=240)
+        else:
+            _set_tc_text(tc, row.get(role, ""), align="left" if role == "Methods" else "center",
+                         indent=120 if role == "Methods" else 60)
+    return tr
+
+
+def _banner_row(banner_tr, text):
+    """Copy of the template's 'Microbiological Specifications' row with new text (same font and size)."""
+    tr = copy.deepcopy(banner_tr)
+    for p in tr.iter(_q("p")):
+        runs = p.findall(_q("r"))
+        if not runs:
+            continue
+        keep = next((r for r in runs if "".join(t.text or "" for t in r.iter(_q("t"))).strip()), runs[0])
+        for r in runs:
+            if r is not keep:
+                p.remove(r)
+        ts = keep.findall(_q("t"))
+        for t in ts[1:]:
+            keep.remove(t)
+        if ts:
+            ts[0].text = text
+        break
     return tr
 
 
@@ -476,7 +527,7 @@ def _widen_single_col_table(tbl, grid_source_tbl):
     return True
 
 
-def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=True):
+def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=False):
     """Fill a Skyherb template. rows: dicts with Group/Characteristic/Standards/Results/Methods/Include."""
     from docx import Document
     doc = Document(io.BytesIO(template_bytes))
@@ -496,21 +547,29 @@ def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=T
     t_mic, i_mic, mic = _find_row(doc, lambda s: "microbiolog" in s and "characteristic" not in s)
 
     # general rows go right below the header row (works whether or not more rows follow)
+    if mic is not None and t_mic is not t_main:
+        _widen_single_col_table(t_mic._tbl, t_main._tbl)
+        mic = t_mic._tbl.findall(_q("tr"))[i_mic]
     anchor, last_group = hdr, None
     for r in general:
-        if group_headings and r.get("Group") != last_group:
-            h = _heading_row(hdr, r.get("Group", ""))
-            anchor.addnext(h)
-            anchor = h
-            last_group = r.get("Group")
+        grp = r.get("Group", "")
+        if grp != last_group:
+            if grp in BANNER_GROUPS:
+                h = _banner_row(mic, grp) if mic is not None else _heading_row(hdr, grp)
+            elif group_headings:
+                h = _heading_row(hdr, grp)
+            else:
+                h = None
+            if h is not None:
+                anchor.addnext(h)
+                anchor = h
+            last_group = grp
         new = _data_row(hdr, roles, r)
         anchor.addnext(new)
         anchor = new
 
     if micro:
         if mic is not None:
-            if t_mic is not t_main:
-                _widen_single_col_table(t_mic._tbl, t_main._tbl)
             anchor = mic
         else:                                        # no micro banner: add a sub-heading in the main table
             h = _heading_row(hdr, "Microbiological")
