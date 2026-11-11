@@ -1055,11 +1055,24 @@ with st.sidebar:
     st.title("🧪 SN Tools")
     st.caption("Skyherb® internal document tools")
     st.markdown("---")
-    _tools = ["🚿 Watermark Remover", "🔬 COA Review", "📄 SPEC & COA Generator", "🔓 PDF Unlocker"]
-    _tool_help = ["Clean supplier PDFs: logos, stamps, white-out, header",
-                  "Check supplier COAs against our specs; draft supplier questions",
-                  "Turn supplier SPEC/COA PDFs into Skyherb Word documents",
-                  "Remove passwords and print/copy restrictions"]
+    _all_tools = [("🚿 Watermark Remover", "Clean supplier PDFs: logos, stamps, white-out, header"),
+                  ("🔬 COA Review", "Check supplier COAs against our specs; draft supplier questions"),
+                  ("📄 SPEC & COA Generator", "Turn supplier SPEC/COA PDFs into Skyherb Word documents"),
+                  ("🔓 PDF Unlocker", "Remove passwords and print/copy restrictions")]
+    # Tools only visible after unlocking with ADMIN_PASSWORD (set in the app's Secrets)
+    ADMIN_TOOLS = {"🔬 COA Review", "📄 SPEC & COA Generator"}
+
+    def _admin_secret():
+        try:
+            return st.secrets.get("ADMIN_PASSWORD")
+        except Exception:
+            return None
+
+    _is_admin = st.session_state.get("sn_admin", False)
+    _visible = [(t, h) for t, h in _all_tools if t not in ADMIN_TOOLS or _is_admin]
+    _tools, _tool_help = [t for t, _ in _visible], [h for _, h in _visible]
+    if st.session_state.get("nav_tool") not in _tools:
+        st.session_state["nav_tool"] = _tools[0]
     try:
         page = st.radio("Tool", options=_tools, captions=_tool_help,
                         label_visibility="collapsed", key="nav_tool")
@@ -1067,6 +1080,27 @@ with st.sidebar:
         page = st.radio("Tool", options=_tools, label_visibility="collapsed", key="nav_tool")
     st.markdown("---")
     st.caption("Files are processed in this session only.")
+
+    # small, unlabelled-looking admin unlock at the bottom of the sidebar
+    def _try_unlock():
+        pw = st.session_state.get("sn_admin_pw", "")
+        secret = _admin_secret()
+        st.session_state["sn_admin"] = bool(secret) and pw == secret
+        st.session_state["sn_admin_pw"] = ""
+        st.session_state["sn_admin_msg"] = "" if st.session_state["sn_admin"] else "Wrong password."
+
+    def _lock():
+        st.session_state["sn_admin"] = False
+
+    if _is_admin:
+        st.caption("🔓 Admin tools unlocked")
+        st.button("Lock admin tools", key="sn_lock", on_click=_lock)
+    elif _admin_secret():
+        with st.expander("🔒 Admin", expanded=False):
+            st.text_input("Password", type="password", key="sn_admin_pw", on_change=_try_unlock,
+                          label_visibility="collapsed", placeholder="Admin password")
+            if st.session_state.get("sn_admin_msg"):
+                st.caption(st.session_state["sn_admin_msg"])
 
 # Shared look & feel
 st.markdown("""
