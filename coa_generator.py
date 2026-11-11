@@ -216,13 +216,15 @@ def apply_our_spec(rows, spec_rows, add_missing=True):
 # Checks before issuing
 # ======================================================================
 
-def check_rows(rows, fields, doc_type="COA", today=None):
+def check_rows(rows, fields, doc_type="COA", today=None, hide=()):
     """Return a list of (level, message); level is 'error', 'warning' or 'info'."""
     today = today or dt.date.today()
+    fields = {k: ("" if k in set(hide or ()) else v) for k, v in fields.items()}
+    hide = set(hide or ())
     out = []
     inc = [r for r in rows if r.get("Include", True)]
     for key, label in (("ProductName", "Product name"), ("LotNo", "Lot No."), ("ManuDate", "Mfg. date")):
-        if doc_type == "SPEC" and key in ("LotNo", "ManuDate"):
+        if (doc_type == "SPEC" and key in ("LotNo", "ManuDate")) or key in hide:
             continue
         if not str(fields.get(key, "")).strip():
             out.append(("warning", f"{label} is empty."))
@@ -527,10 +529,88 @@ def _widen_single_col_table(tbl, grid_source_tbl):
     return True
 
 
-def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=False):
-    """Fill a Skyherb template. rows: dicts with Group/Characteristic/Standards/Results/Methods/Include."""
+# header label text -> field key (used when the value cell has no {{placeholder}})
+_LABEL_KEYS = [("ProductName", r"product\s*name"), ("Brand", r"brand"), ("LotNo", r"lot|batch"),
+               ("Quantity", r"quantity"), ("ManuDate", r"mfg|manufactur|production"),
+               ("ExpiryDate", r"exp"), ("ShelfLife", r"shelf"), ("PlantPart", r"plant\s*part|part\s*used"),
+               ("LatinName", r"latin|botanical"), ("Origin", r"origin"), ("Solvent", r"solvent")]
+
+
+def _tc_text(tc):
+    return "".join(t.text or "" for t in tc.iter(_q("t"))).strip()
+
+
+def _pair_key(label_tc, value_tc):
+    m = re.search(r"\{\{\s*(\w+)\s*\}\}", _tc_text(value_tc))
+    if m:
+        return m.group(1)
+    label = _tc_text(label_tc).lower()
+    for key, rx in _LABEL_KEYS:
+        if re.search(rx, label):
+            return key
+    return None
+
+
+def _blank_tc(tc):
+    ps = tc.findall(_q("p"))
+    for p in ps[1:]:
+        tc.remove(p)
+    if ps:
+        for child in list(ps[0]):
+            if child.tag != _q("pPr"):
+                ps[0].remove(child)
+
+
+def _put_tc(tc, paragraphs):
+    for p in tc.findall(_q("p")):
+        tc.remove(p)
+    for p in paragraphs:
+        tc.append(copy.deepcopy(p))
+
+
+def hide_header_fields(doc, hide):
+    """Remove label/value pairs (e.g. PlantPart, LatinName) from the header block and close up the gaps."""
+    hide = set(hide or ())
+    if not hide:
+        return
+    t, i_hdr, hdr = _find_row(doc, lambda s: "characteristic" in s and ("standard" in s or "spec" in s))
+    if hdr is None:
+        return
+    trs = t._tbl.findall(_q("tr"))[:i_hdr]
+    slots, pairs = [], []
+    for tr in trs:
+        tcs = tr.findall(_q("tc"))
+        if len(tcs) < 2 or len(tcs) % 2:
+            continue
+        for j in range(0, len(tcs), 2):
+            lt, vt = tcs[j], tcs[j + 1]
+            slots.append((tr, lt, vt))
+            if _tc_text(lt):
+                pairs.append((_pair_key(lt, vt), [copy.deepcopy(p) for p in lt.findall(_q("p"))],
+                              [copy.deepcopy(p) for p in vt.findall(_q("p"))]))
+    kept = [p for p in pairs if p[0] not in hide]
+    if len(kept) == len(pairs):
+        return
+    used_rows = set()
+    for n, (tr, lt, vt) in enumerate(slots):
+        if n < len(kept):
+            _put_tc(lt, kept[n][1])
+            _put_tc(vt, kept[n][2])
+            used_rows.add(id(tr))
+        else:
+            _blank_tc(lt)
+            _blank_tc(vt)
+    for tr in {id(s[0]): s[0] for s in slots}.values():
+        if id(tr) not in used_rows:
+            tr.getparent().remove(tr)
+
+
+def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=False, hide=()):
+    """Fill a Skyherb template. rows: dicts with Group/Characteristic/Standards/Results/Methods/Include.
+    hide: field keys to leave off the document, e.g. {"PlantPart", "LatinName"} for a non-botanical product."""
     from docx import Document
     doc = Document(io.BytesIO(template_bytes))
+    hide_header_fields(doc, hide)
     for p in _all_paragraphs(doc):
         _replace_in_paragraph(p, fields)
 
