@@ -605,11 +605,13 @@ def hide_header_fields(doc, hide):
             tr.getparent().remove(tr)
 
 
-def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=False, hide=()):
+def fill_template(template_bytes, fields, rows, doc_type="COA", group_headings=False, hide=(), letterhead=None):
     """Fill a Skyherb template. rows: dicts with Group/Characteristic/Standards/Results/Methods/Include.
     hide: field keys to leave off the document, e.g. {"PlantPart", "LatinName"} for a non-botanical product."""
     from docx import Document
     doc = Document(io.BytesIO(template_bytes))
+    if letterhead:
+        set_letterhead(doc, letterhead)
     hide_header_fields(doc, hide)
     for p in _all_paragraphs(doc):
         _replace_in_paragraph(p, fields)
@@ -687,3 +689,282 @@ def docx_to_pdf(docx_bytes):
                 return f.read()
         except Exception:
             return None
+
+
+# ======================================================================
+# Letterhead
+# ======================================================================
+
+def set_letterhead(doc, image_bytes):
+    """Replace the template's letterhead (pictures above / attached to the title) with our header image."""
+    from docx.shared import Emu
+    from docx.text.paragraph import Paragraph
+    paras = doc.paragraphs
+    title_i = next((i for i, p in enumerate(paras)
+                    if re.search(r"certificate|specification", p.text, re.I)), -1)
+    top = paras[:title_i + 1] if title_i >= 0 else paras[:1]
+    for p in top:                                   # remove every old picture, floating or inline
+        for r in list(p._p.iter(_q("r"))):
+            if r.find(".//" + _q("pict")) is not None or r.find(".//" + _q("drawing")) is not None or \
+                    any(el.tag.endswith("AlternateContent") for el in r):
+                r.getparent().remove(r)
+    spacers = [p for p in top[:-1] if not p.text.strip()] if title_i > 0 else []
+    if spacers:                                     # empty lines that made room for the old picture
+        target = spacers[0]
+        for p in spacers[1:]:
+            p._p.getparent().remove(p._p)
+    else:
+        first = doc.element.body[0]
+        target_el = first.makeelement(_q("p"), {})
+        first.addprevious(target_el)
+        target = Paragraph(target_el, doc._body)
+    for child in list(target._p):
+        if child.tag != _q("pPr"):
+            target._p.remove(child)
+    ppr = target._p.get_or_add_pPr()
+    for tag in ("ind", "pBdr", "jc", "spacing"):
+        for el in ppr.findall(_q(tag)):
+            ppr.remove(el)
+    ppr.append(ppr.makeelement(_q("ind"), {_q("left"): "0", _q("right"): "0"}))
+    ppr.append(ppr.makeelement(_q("spacing"), {_q("before"): "0", _q("after"): "60"}))
+    bdr = ppr.makeelement(_q("pBdr"), {})
+    bdr.append(bdr.makeelement(_q("bottom"), {_q("val"): "single", _q("sz"): "6", _q("space"): "1",
+                                               _q("color"): "8C8C8C"}))
+    ppr.append(bdr)
+    s = doc.sections[0]
+    width = s.page_width - s.left_margin - s.right_margin
+    target.add_run().add_picture(io.BytesIO(image_bytes), width=Emu(int(width)))
+
+
+# ======================================================================
+# PDF (built directly, for servers without LibreOffice)
+# ======================================================================
+
+_FONTS = {}
+
+
+def _register_fonts(font_dir):
+    """Liberation Serif/Sans (metric clones of Times New Roman/Arial) + a wide-coverage fallback."""
+    if _FONTS:
+        return _FONTS
+    import os
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    want = {"serif": "LiberationSerif-Regular.ttf", "serif_b": "LiberationSerif-Bold.ttf",
+            "serif_i": "LiberationSerif-Italic.ttf", "sans": "LiberationSans-Regular.ttf",
+            "sans_b": "LiberationSans-Bold.ttf"}
+    system = ["/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/liberation2",
+              "/usr/share/fonts/truetype/dejavu"]
+    for key, fname in want.items():
+        for d in [font_dir, os.path.dirname(font_dir or ".")] + system:   # fonts/ folder, or next to the app
+            path = os.path.join(d, fname) if d else ""
+            if path and os.path.isfile(path):
+                pdfmetrics.registerFont(TTFont(f"SN-{key}", path))
+                _FONTS[key] = f"SN-{key}"
+                break
+    builtin = {"serif": "Times-Roman", "serif_b": "Times-Bold", "serif_i": "Times-Italic",
+               "sans": "Helvetica", "sans_b": "Helvetica-Bold"}
+    for key, name in builtin.items():
+        _FONTS.setdefault(key, name)
+    try:
+        try:
+            import pymupdf as _fz
+        except ImportError:
+            import fitz as _fz
+        pdfmetrics.registerFont(TTFont("SN-fallback", io.BytesIO(_fz.Font("cjk").buffer)))
+        _FONTS["fallback"] = "SN-fallback"
+    except Exception:
+        pass
+    return _FONTS
+
+
+def _markup(text, font):
+    """Escape text for a reportlab Paragraph; characters the font lacks use the fallback font."""
+    from xml.sax.saxutils import escape
+    from reportlab.pdfbase import pdfmetrics
+    text = str(text or "")
+    fb = _FONTS.get("fallback")
+    try:
+        face = pdfmetrics.getFont(font).face
+        has = getattr(face, "charToGlyph", None)
+    except Exception:
+        has = None
+    if not fb or has is None:
+        return escape(text)
+    out, run, run_fb = [], "", False
+    for ch in text:
+        need_fb = ord(ch) > 127 and ord(ch) not in has and ch not in "\n\t"
+        if need_fb != run_fb and run:
+            out.append(f'<font name="{fb}">{escape(run)}</font>' if run_fb else escape(run))
+            run = ""
+        run_fb = need_fb
+        run += ch
+    if run:
+        out.append(f'<font name="{fb}">{escape(run)}</font>' if run_fb else escape(run))
+    return "".join(out)
+
+
+def _para_markup(p_el, base_font, bold_font):
+    """A docx paragraph (with its bold/underline runs) as reportlab markup."""
+    parts = []
+    for r in p_el.iter(_q("r")):
+        txt = "".join((t.text or "") if t.tag == _q("t") else "    " for t in r if t.tag in (_q("t"), _q("tab")))
+        if not txt:
+            continue
+        rpr = r.find(_q("rPr"))
+        bold = rpr is not None and rpr.find(_q("b")) is not None and \
+            rpr.find(_q("b")).get(_q("val"), "true") not in ("0", "false")
+        und = rpr is not None and rpr.find(_q("u")) is not None and rpr.find(_q("u")).get(_q("val")) != "none"
+        m = _markup(txt, bold_font if bold else base_font).replace("    ", "&nbsp;&nbsp;&nbsp;&nbsp;")
+        if bold:
+            m = f'<font name="{bold_font}">{m}</font>'
+        if und:
+            m = f"<u>{m}</u>"
+        parts.append(m)
+    return "".join(parts)
+
+
+def render_pdf(docx_bytes, rows, doc_type="COA", group_headings=False, letterhead=None, font_dir=""):
+    """Draw the filled document as a PDF in the template's layout (title, header fields, tests, statements)."""
+    from docx import Document
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+    from reportlab.lib.utils import ImageReader
+
+    F = _register_fonts(font_dir)
+    doc = Document(io.BytesIO(docx_bytes))
+    s = doc.sections[0]
+    emu = 1 / 12700.0
+    page = (s.page_width * emu, s.page_height * emu)
+    lm, rm = s.left_margin * emu, s.right_margin * emu
+    tm, bm = max(s.top_margin * emu, 20), max(s.bottom_margin * emu, 20)
+    width = page[0] - lm - rm
+
+    green = colors.HexColor("#008000")
+    st_label = ParagraphStyle("lbl", fontName=F["serif_b"], fontSize=10.5, leading=12.5)
+    st_val = ParagraphStyle("val", fontName=F["sans"], fontSize=10.5, leading=12.5)
+    st_name = ParagraphStyle("name", fontName=F["serif_b"], fontSize=10.5, leading=12.5, leftIndent=8)
+    st_cell = ParagraphStyle("cell", fontName=F["sans"], fontSize=10.5, leading=12.5, alignment=TA_CENTER)
+    st_cell_l = ParagraphStyle("celll", parent=st_cell, alignment=TA_LEFT, leftIndent=4)
+    st_head = ParagraphStyle("head", fontName=F["serif_b"], fontSize=14, leading=16)
+    st_head_c = ParagraphStyle("headc", parent=st_head, alignment=TA_CENTER)
+    st_banner = ParagraphStyle("ban", fontName=F["serif_b"], fontSize=14, leading=16, leftIndent=8)
+    st_grp = ParagraphStyle("grp", fontName=F["serif_i"], fontSize=10.5, leading=12.5)
+    st_title = ParagraphStyle("title", fontName=F["serif_b"], fontSize=17, leading=21, alignment=TA_CENTER,
+                              spaceBefore=4, spaceAfter=6)
+    st_stmt = ParagraphStyle("stmt", fontName=F["sans"], fontSize=10.5, leading=13.5, leftIndent=6)
+
+    P = lambda text, style: Paragraph(_markup(text, style.fontName), style)
+    story = []
+
+    # letterhead: ours if given, otherwise the template's own picture
+    img_bytes = letterhead
+    if img_bytes is None:
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                img_bytes = rel.target_part.blob
+                break
+    if img_bytes:
+        ir = ImageReader(io.BytesIO(img_bytes))
+        iw, ih = ir.getSize()
+        story.append(Image(io.BytesIO(img_bytes), width=width, height=width * ih / iw))
+        line = Table([[""]], colWidths=[width], rowHeights=[2])
+        line.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.75, colors.HexColor("#8C8C8C"))]))
+        story.append(line)
+
+    title = next((p.text.strip() for p in doc.paragraphs if re.search(r"certificate|specification", p.text, re.I)),
+                 "CERTIFICATE OF ANALYSIS" if doc_type == "COA" else "PRODUCT SPECIFICATIONS")
+    story.append(Paragraph(_markup(title, F["serif_b"]), st_title))
+
+    # header fields, as filled in the Word file
+    t_main, i_hdr, hdr = _find_row(doc, lambda x: "characteristic" in x and ("standard" in x or "spec" in x))
+    pairs = []
+    for tr in t_main._tbl.findall(_q("tr"))[:i_hdr]:
+        tcs = tr.findall(_q("tc"))
+        for j in range(0, len(tcs) - 1, 2):
+            if _tc_text(tcs[j]):
+                pairs.append((_tc_text(tcs[j]), _tc_text(tcs[j + 1])))
+    pairs += [("", "")] * (len(pairs) % 2)
+    info = [[P(a, st_label), P(b, st_val), P(c, st_label), P(d, st_val)]
+            for (a, b), (c, d) in zip(pairs[0::2], pairs[1::2])]
+    if info:
+        cw = [0.205, 0.30, 0.19, 0.305]
+        t = Table(info, colWidths=[w * width for w in cw])
+        t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, green), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                               ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        story.append(t)
+
+    # tests
+    roles = _col_roles(hdr)
+    ws = []
+    for tc in hdr.findall(_q("tc")):
+        w = tc.find(_q("tcPr")).find(_q("tcW")) if tc.find(_q("tcPr")) is not None else None
+        ws.append(int(w.get(_q("w"))) if w is not None and (w.get(_q("w")) or "").isdigit() else 1)
+    colw = [w / sum(ws) * width for w in ws]
+    ncol = len(roles)
+    data = [[P(r if r != "Characteristic" else "Characteristic", st_head if r == "Characteristic" else st_head_c)
+             for r in roles]]
+    style = [("GRID", (0, 0), (-1, -1), 0.5, green), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#C0C0C0")),
+             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+             ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5)]
+    inc = [r for r in rows if r.get("Include", True) and str(r.get("Characteristic", "")).strip()]
+    last = None
+    for r in inc:
+        grp = r.get("Group", "")
+        if grp != last:
+            text = None
+            if grp == "Microbiological":
+                text, st_ = "Microbiological Specifications", st_banner
+            elif grp in BANNER_GROUPS:
+                text, st_ = grp, st_banner
+            elif group_headings:
+                text, st_ = grp, st_grp
+            if text:
+                data.append([P(text, st_)] + [""] * (ncol - 1))
+                style.append(("SPAN", (0, len(data) - 1), (-1, len(data) - 1)))
+                if st_ is st_grp:
+                    style.append(("BACKGROUND", (0, len(data) - 1), (-1, len(data) - 1), colors.HexColor("#EEF4F1")))
+            last = grp
+        cells = []
+        for role in roles:
+            if role == "Characteristic":
+                cells.append(P(r.get(role, ""), st_name))
+            elif role == "Results" and doc_type != "COA":
+                cells.append("")
+            else:
+                cells.append(P(r.get(role, ""), st_cell_l if role == "Methods" else st_cell))
+        data.append(cells)
+    t = Table(data, colWidths=colw, repeatRows=1)
+    t.setStyle(TableStyle(style))
+    story.append(t)
+
+    # statements block from the template ("Statements", "*Appearance: …", "Analyzed by …")
+    s_tbl, s_i, s_tr = _find_row(doc, lambda x: x.strip().startswith("statements"))
+    if s_tr is not None:
+        st_rows = []
+        for tr in s_tbl._tbl.findall(_q("tr"))[s_i:]:
+            paras = []
+            for tc in tr.findall(_q("tc")):
+                for p_el in tc.findall(_q("p")):
+                    m = _para_markup(p_el, F["sans"], F["serif_b"])
+                    if m.strip():
+                        paras.append(m)
+            if not paras:
+                continue
+            text = "&nbsp;&nbsp;&nbsp;&nbsp;".join(paras)
+            plain = re.sub(r"<[^>]+>", "", text).strip().lower()
+            st_rows.append([Paragraph(text, st_head if plain == "statements" else st_stmt)])
+        if st_rows:
+            if s_tbl is not t_main:
+                story.append(Spacer(1, 6))
+            t = Table(st_rows, colWidths=[width])
+            t.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, green), ("LINEBELOW", (0, 0), (-1, -2), 0.5, green),
+                                   ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+            story.append(t)
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=page, leftMargin=lm, rightMargin=rm, topMargin=tm, bottomMargin=bm,
+                      title=title).build(story)
+    return buf.getvalue()
