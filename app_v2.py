@@ -1119,11 +1119,18 @@ if page == "📄 SPEC & COA Generator":
               ("PlantPart", "Plant part"), ("LatinName", "Plant Latin name"),
               ("Origin", "Country of origin"), ("Solvent", "Extraction solvent")]
     NONE = "— not in spec library —"
+    HIDEABLE = [("Brand", "Brand"), ("LotNo", "Lot No."), ("Quantity", "Quantity"), ("ManuDate", "Mfg. date"),
+                ("ShelfLife", "Shelf life"), ("PlantPart", "Plant part"), ("LatinName", "Plant Latin name"),
+                ("Origin", "Country of origin"), ("Solvent", "Extraction solvent")]
+    HIDE_LABEL = dict(HIDEABLE)
+    HIDE_KEY = {v: k for k, v in HIDEABLE}
+    NA = re.compile(r"^\s*(n/?a|none|not applicable|-+|—)\s*$", re.I)
 
     st.session_state.setdefault("gen_rows", [])
     st.session_state.setdefault("gen_rows_v", 0)
     st.session_state.setdefault("gen_msgs", [])
     st.session_state.setdefault("gen_doctype", "COA")
+    st.session_state.setdefault("gen_hide", [])
     for k, _ in FIELDS:
         st.session_state.setdefault(f"gen_f_{k}", "China" if k == "Origin" else "")
 
@@ -1152,6 +1159,7 @@ if page == "📄 SPEC & COA Generator":
         st.session_state.pop("gen_out", None)
         st.session_state["gen_product"] = NONE
         st.session_state["gen_doctype"] = "COA"
+        st.session_state["gen_hide"] = []
 
     def _gen_read():
         """Read the uploaded supplier document into the form (runs before the widgets are drawn)."""
@@ -1205,6 +1213,16 @@ if page == "📄 SPEC & COA Generator":
             if exp:
                 values["ExpiryDate"] = exp.isoformat()
                 msgs.append(("info", "Expiry date calculated from the mfg. date and shelf life."))
+        hide = [k for k in ("PlantPart", "LatinName", "Solvent") if NA.match(pinfo.get(
+            {"PlantPart": "Plant part", "LatinName": "Latin name", "Solvent": "Extraction solvent"}[k], "") or "x")]
+        if not values["PlantPart"].strip() and not values["LatinName"].strip():
+            hide = sorted(set(hide) | {"PlantPart", "LatinName"}, key=list(HIDE_LABEL).index)
+        for k in hide:
+            values[k] = ""
+        st.session_state["gen_hide"] = [HIDE_LABEL[k] for k in hide]
+        if hide:
+            msgs.append(("info", "Left off the document: " + ", ".join(HIDE_LABEL[k] for k in hide)
+                         + " (no value for this product). Change it under ② if needed."))
         for k, v in values.items():
             st.session_state[f"gen_f_{k}"] = cr.norm_text(v)
 
@@ -1307,8 +1325,25 @@ if page == "📄 SPEC & COA Generator":
                          help="Used for the product details and, if you choose, our spec limits.")
         with pc2:
             date_fmt = st.selectbox("Date format", list(cg.DATE_FORMATS), key="gen_datefmt")
+        def _not_botanical():
+            st.session_state["gen_hide"] = sorted(set(st.session_state.get("gen_hide", []))
+                                                  | {"Plant part", "Plant Latin name"}, key=list(HIDE_KEY).index)
+
+        hc1, hc2 = st.columns([3, 1.2])
+        with hc1:
+            hide_opts = [l for k, l in HIDEABLE if "COA" in kinds or k not in BATCH]
+            st.session_state["gen_hide"] = [h for h in st.session_state.get("gen_hide", []) if h in hide_opts]
+            st.multiselect("Leave off the document", hide_opts, key="gen_hide",
+                           help="These rows are removed from the document's header table; the rest close up.")
+        with hc2:
+            st.write("")
+            st.button("🧪 Not plant-derived", key="gen_not_bot", on_click=_not_botanical,
+                      help="Leaves off Plant part and Plant Latin name (e.g. Berberine HCl, synthetic or "
+                           "fermented ingredients).")
+        hidden = {HIDE_KEY[h] for h in st.session_state.get("gen_hide", [])}
+
         fc1, fc2 = st.columns(2)
-        shown_fields = [(k, l) for k, l in FIELDS if "COA" in kinds or k not in BATCH]
+        shown_fields = [(k, l) for k, l in FIELDS if ("COA" in kinds or k not in BATCH) and k not in hidden]
         for i, (k, label) in enumerate(shown_fields):
             with (fc1 if i % 2 == 0 else fc2):
                 st.text_input(label, key=f"gen_f_{k}")
@@ -1357,6 +1392,8 @@ if page == "📄 SPEC & COA Generator":
     for k in ("ManuDate", "ExpiryDate"):
         fields[k] = cg.format_date(fields[k], date_fmt) if fields[k] else ""
     fields["Brand"] = "Skyherb®"
+    for k in hidden:
+        fields[k] = ""
     fields["IssueDate"] = cg.format_date(datetime.today().strftime("%Y-%m-%d"), date_fmt)
 
     with right:
@@ -1385,14 +1422,16 @@ if page == "📄 SPEC & COA Generator":
         st.markdown("**✅ Checks before issuing**")
         checks = []
         for k in kinds:
-            checks += [(lvl, (f"[{k}] " if len(kinds) > 1 else "") + m) for lvl, m in cg.check_rows(rows, fields, k)]
+            checks += [(lvl, (f"[{k}] " if len(kinds) > 1 else "") + m)
+                       for lvl, m in cg.check_rows(rows, fields, k, hide=hidden)]
         for k in kinds:
             tb = _tpl(k)
             if tb:
                 try:
                     from docx import Document as _D
                     have = cg.placeholders_in(_D(io.BytesIO(tb)))
-                    if "ExpiryDate" not in have and fields.get("ExpiryDate") and k == "COA":
+                    if "ExpiryDate" not in have and fields.get("ExpiryDate") and k == "COA" \
+                            and "ExpiryDate" not in hidden:
                         checks.append(("info", "The COA template has no {{ExpiryDate}} placeholder, so the expiry "
                                                "date won't appear. Add it to the template in Word to show it."))
                 except Exception:
@@ -1426,6 +1465,14 @@ if page == "📄 SPEC & COA Generator":
                        ("Extraction Solvent", fields["Solvent"], "Shelf Life", fields["ShelfLife"]),
                        ("Plant Part", fields["PlantPart"], "Plant Latin Name", fields["LatinName"]),
                        ("Country of origin", fields["Origin"], "", "")]
+            pairs = [(a, b) for a, b, c, d in hdr for a, b in ((a, b), (c, d)) if a]
+            key_of = {"Brand": "Brand", "Lot No.": "LotNo", "Quantity": "Quantity", "Mfg. Date": "ManuDate",
+                      "Shelf Life": "ShelfLife", "Plant Part": "PlantPart", "Plant Latin Name": "LatinName",
+                      "Country of Origin": "Origin", "Country of origin": "Origin", "Solvent": "Solvent",
+                      "Extraction Solvent": "Solvent"}
+            pairs = [(a, b) for a, b in pairs if key_of.get(a) not in hidden]
+            pairs += [("", "")] * (len(pairs) % 2)
+            hdr = [(pairs[i][0], pairs[i][1], pairs[i + 1][0], pairs[i + 1][1]) for i in range(0, len(pairs), 2)]
             h = ["<div class='sn-doc'><h4>" + ("CERTIFICATE OF ANALYSIS" if show_res else "PRODUCT SPECIFICATIONS")
                  + "</h4><table>"]
             h += [f"<tr><td class='lbl'>{e(a)}</td><td>{e(b)}</td><td class='lbl'>{e(c)}</td><td>{e(d)}</td></tr>"
@@ -1466,7 +1513,7 @@ if page == "📄 SPEC & COA Generator":
                 if not tb:
                     continue
                 try:
-                    docx_bytes = cg.fill_template(tb, fields, rows, k, group_headings)
+                    docx_bytes = cg.fill_template(tb, fields, rows, k, group_headings, hide=hidden)
                     stem = f"SN-{k}-{safe(fields['ProductName'] or 'product')}" + (
                         f"-{safe(fields['LotNo'])}" if k == "COA" and fields["LotNo"] else "")
                     out[k] = {"docx": docx_bytes, "stem": stem, "pdf": cg.docx_to_pdf(docx_bytes)}
