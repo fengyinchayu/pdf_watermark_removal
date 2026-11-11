@@ -1403,6 +1403,11 @@ if page == "📄 SPEC & COA Generator":
             panel = st.container()
     with panel:
         st.markdown(f"**Creating: {' + '.join(kinds)}**")
+        has_sn = os.path.isfile(HEADER_IMAGE_PATH)
+        use_sn = st.toggle("Skyherb Nutritionals letterhead", value=has_sn, disabled=not has_sn, key="gen_sn_header",
+                           help="Replaces the template's letterhead with SN_Header.png on every document."
+                           if has_sn else "Add SN_Header.png next to app_v2.py to use it.")
+        sn_bytes = open(HEADER_IMAGE_PATH, "rb").read() if (use_sn and has_sn) else None
         missing_tpl = [k for k in kinds if not os.path.isfile(TEMPLATES[k])]
         with st.expander("Templates", expanded=bool(missing_tpl)):
             for k in ("COA", "SPEC"):
@@ -1513,10 +1518,18 @@ if page == "📄 SPEC & COA Generator":
                 if not tb:
                     continue
                 try:
-                    docx_bytes = cg.fill_template(tb, fields, rows, k, group_headings, hide=hidden)
+                    docx_bytes = cg.fill_template(tb, fields, rows, k, group_headings, hide=hidden,
+                                                  letterhead=sn_bytes)
                     stem = f"SN-{k}-{safe(fields['ProductName'] or 'product')}" + (
                         f"-{safe(fields['LotNo'])}" if k == "COA" and fields["LotNo"] else "")
-                    out[k] = {"docx": docx_bytes, "stem": stem, "pdf": cg.docx_to_pdf(docx_bytes)}
+                    pdf_bytes = cg.docx_to_pdf(docx_bytes)          # exact copy of the Word file, if LibreOffice exists
+                    if pdf_bytes is None:                            # otherwise draw it in the template's layout
+                        try:
+                            pdf_bytes = cg.render_pdf(docx_bytes, rows, k, group_headings, letterhead=sn_bytes,
+                                                      font_dir=os.path.join(APP_DIR, "fonts"))
+                        except Exception as ex:
+                            st.warning(f"PDF for the {k} couldn't be created: {ex}")
+                    out[k] = {"docx": docx_bytes, "stem": stem, "pdf": pdf_bytes}
                     with open(os.path.join("outputs", stem + ".docx"), "wb") as f:
                         f.write(docx_bytes)
                 except Exception as ex:
@@ -1535,7 +1548,7 @@ if page == "📄 SPEC & COA Generator":
                     _stretch_call(st.download_button, f"⬇️ {k} (PDF)", o["pdf"], file_name=o["stem"] + ".pdf",
                                   mime="application/pdf", key=f"gen_dl_pdf_{k}")
             if o["pdf"]:
-                with st.expander(f"Exact preview — {k}"):
+                with st.expander(f"Preview the {k} PDF"):
                     try:
                         import fitz as _fz
                     except ImportError:
@@ -1544,8 +1557,7 @@ if page == "📄 SPEC & COA Generator":
                     for pg in d:
                         pix = pg.get_pixmap(dpi=80)
                         _stretch_call(st.image, pix.tobytes("png"))
-        if out and not any(o["pdf"] for o in out.values()):
-            st.caption("PDF download needs LibreOffice on the server; open the Word file and save as PDF instead.")
+
 
 
 # ==============================
